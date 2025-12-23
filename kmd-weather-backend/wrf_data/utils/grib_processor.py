@@ -31,14 +31,14 @@ class GRIBProcessor:
         },
         'temp-max': {
             'name': '2 metre temperature',
-            'shortName': '2t',
+            'shortName': 'tmax',
             'typeOfLevel': 'heightAboveGround',
             'level': 2,
             'aggregate': 'max',  # Get maximum value
         },
         'temp-min': {
             'name': '2 metre temperature',
-            'shortName': '2t',
+            'shortName': 'tmin',
             'typeOfLevel': 'heightAboveGround',
             'level': 2,
             'aggregate': 'min',  # Get minimum value

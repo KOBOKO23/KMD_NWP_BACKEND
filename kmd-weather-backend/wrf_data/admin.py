@@ -8,6 +8,7 @@ from django.utils.html import format_html
 from django.http import HttpResponse
 from .models import Domain, Parameter, ForecastRun, ForecastData, DataFetchLog
 from .tasks import fetch_and_process_wrf_data # for retry action
+from django.utils.safestring import mark_safe
 
 
 # ----------------------
@@ -50,9 +51,9 @@ class DomainAdmin(admin.ModelAdmin):
 
     def is_active_badge(self, obj):
         if obj.is_active:
-            return format_html('<span style="color: green;">✓ Active</span>')
+            return mark_safe('<span style="color: green;">✓ Active</span>')
         return format_html('<span style="color: red;">✗ Inactive</span>')
-    is_active_badge.short_description = 'Status'
+
 
 
 # ----------------------
@@ -93,8 +94,8 @@ class ParameterAdmin(admin.ModelAdmin):
 
     def is_active_badge(self, obj):
         if obj.is_active:
-            return format_html('<span style="color: green;">✓ Active</span>')
-        return format_html('<span style="color: red;">✗ Inactive</span>')
+            return format_html('{}', '<span style="color: green;">✓ Active</span>')
+        return format_html('{}', '<span style="color: red;">✗ Inactive</span>')
     is_active_badge.short_description = 'Status'
 
 
@@ -332,7 +333,7 @@ class DataFetchLogAdmin(admin.ModelAdmin):
     # Actions
     def retry_fetch(self, request, queryset):
         for log in queryset:
-            fetch_forecast_data_task.delay(log.forecast_run.id)
+            fetch_and_process_wrf_data.delay(log.forecast_run.id)
         self.message_user(request, f"Retry task enqueued for {queryset.count()} logs")
     retry_fetch.short_description = "Retry Data Fetch"
 

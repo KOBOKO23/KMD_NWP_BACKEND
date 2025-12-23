@@ -12,6 +12,9 @@ from django.utils import timezone
 from django.db.models import Q, Max
 from datetime import datetime, timedelta
 import logging
+from rest_framework.decorators import api_view
+import numpy as np
+
 
 from .models import Domain, Parameter, ForecastRun, ForecastData, DataFetchLog
 from .serializers import (
@@ -29,6 +32,7 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 
 class DomainViewSet(viewsets.ReadOnlyModelViewSet):
@@ -325,3 +329,103 @@ class DataFetchLogViewSet(viewsets.ReadOnlyModelViewSet):
             queryset = queryset.filter(status=status)
         
         return queryset
+
+
+@api_view(["GET"])
+def ping(request):
+    return Response({
+        "status": "ok",
+        "message": "backend is alive"
+    })
+
+
+@api_view(['GET'])
+def get_raw_grib_data(request):
+    """
+    Quick endpoint to test GRIB data extraction with color mapping
+    GET /api/test-grib/?parameter=rainfall&timestep=0&domain=kenya
+    """
+    from .utils.grib_processor import GRIBProcessor
+    from .utils.color_mapper import get_mapper_for_parameter
+    import os
+    from django.conf import settings
+    
+    parameter = request.GET.get('parameter', 'rainfall')
+    timestep = int(request.GET.get('timestep', 0))
+    domain = request.GET.get('domain', 'kenya')
+    
+    # Determine domain suffix
+    domain_suffix = '01' if domain == 'kenya' else '02'
+    
+    # Find latest data
+    data_dir = os.path.join(settings.BASE_DIR, 'data', 'raw')
+    if not os.path.exists(data_dir):
+        return Response({'error': 'No data directory found'}, status=status.HTTP_404_NOT_FOUND)
+        
+    dates = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+    if not dates:
+        return Response({'error': 'No data available'}, status=status.HTTP_404_NOT_FOUND)
+        
+    latest_date = dates[-1]
+    grib_file = os.path.join(data_dir, latest_date, f'WRFPRS_d{domain_suffix}.{timestep:02d}')
+    
+    if not os.path.exists(grib_file):
+        return Response({'error': f'GRIB file not found: {grib_file}'}, status=status.HTTP_404_NOT_FOUND)
+    
+    try:
+        with GRIBProcessor(grib_file) as processor:
+            data = processor.extract_parameter(parameter, apply_color_mapping=False)
+            
+            if not data:
+                return Response({'error': f'Parameter {parameter} not found in GRIB file'}, status=status.HTTP_404_NOT_FOUND)
+            
+            # Get color mapper for this parameter
+            mapper = get_mapper_for_parameter(parameter)
+            
+            # Downsample for faster transfer (take every 5th point for Kenya, 3rd for East Africa)
+            step = 5 if domain == 'kenya' else 3
+            
+            lats = np.array(data['lats'])
+            lons = np.array(data['lons'])
+            values = np.array(data['values'])
+            
+            lats_sampled = lats[::step, ::step]
+            lons_sampled = lons[::step, ::step]
+            values_sampled = values[::step, ::step]
+            
+            # Convert to list of points for frontend with pre-computed colors
+            points = []
+            for i in range(lats_sampled.shape[0]):
+                for j in range(lats_sampled.shape[1]):
+                    value = values_sampled[i, j]
+                    if not np.isnan(value):
+                        color = mapper.map_value(value)
+                        points.append({
+                            'lat': float(lats_sampled[i, j]),
+                            'lon': float(lons_sampled[i, j]),
+                            'value': float(value),
+                            'color': color  # Pre-computed color from backend
+                        })
+            
+            return Response({
+                'success': True,
+                'file': grib_file,
+                'parameter': parameter,
+                'timestep': timestep,
+                'domain': domain,
+                'points': points,
+                'metadata': {
+                    'name': processor.PARAMETER_MAPPING[parameter]['name'],
+                    'unit': data['metadata'].get('units', 'unknown'),
+                    'min_value': data['metadata']['min'],
+                    'max_value': data['metadata']['max'],
+                    'mean_value': data['metadata']['mean'],
+                    'original_shape': [lats.shape[0], lats.shape[1]],
+                    'sampled_shape': [lats_sampled.shape[0], lons_sampled.shape[1]],
+                    'total_points': len(points)
+                },
+                'legend': mapper.get_legend_items()  # Color scale legend
+            })
+    except Exception as e:
+        logger.error(f"Error processing GRIB: {e}", exc_info=True)
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
