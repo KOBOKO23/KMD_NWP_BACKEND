@@ -1,224 +1,223 @@
 """
-Color Mapper Utility
-Maps parameter values to color scales defined in frontend
+Color Mapper Utility - Official KMD Standard
+Maps WRF output values to official KMD color legend (contours)
 File: wrf_data/utils/color_mapper.py
+
+Based on operational standard:
+- Rainfall: 0mm = WHITE (no rain), then colored bins
+- Temperatures: All regions have color (no zero temps in Kenya)
+- Exact RGB values from official standard
 """
 
 import numpy as np
 from typing import List, Dict, Any
 
 
+TRANSPARENT = 'rgba(0,0,0,0)'
+
+
 class ColorMapper:
     """
-    Maps numerical weather data to color values based on defined color scales
+    Maps numerical weather data to colors based on official KMD legend bins
     """
-    
+
     def __init__(self, color_scale: List[Dict[str, Any]]):
-        """
-        Initialize with a color scale configuration
-        
-        Args:
-            color_scale: List of dicts with 'min', 'max', 'color' keys
-                        Example: [{'min': 0, 'max': 10, 'color': '#ffffff'}, ...]
-        """
         self.color_scale = sorted(color_scale, key=lambda x: x['min'])
-    
+
     def map_value(self, value: float) -> str:
         """
-        Map a single value to its corresponding color
-        
-        Args:
-            value: Numerical value to map
-            
-        Returns:
-            Hex color string (e.g., '#ffffff')
+        Map a single value to hex color
         """
-        if np.isnan(value) or value is None:
-            return '#cccccc'  # Gray for missing data
+        if value is None or np.isnan(value):
+            return TRANSPARENT
+
+        # Find the appropriate bin
+        for item in self.color_scale:
+            if item['min'] <= value < item['max']:
+                return item['color']
+
+        # If above all bins, use last color
+        if value >= self.color_scale[-1]['max']:
+            return self.color_scale[-1]['color']
         
-        # Find the appropriate color range
-        for scale_item in self.color_scale:
-            if scale_item['min'] <= value < scale_item['max']:
-                return scale_item['color']
-        
-        # If value exceeds all ranges, return the last color
-        return self.color_scale[-1]['color']
-    
+        # If below all bins, use first color
+        return self.color_scale[0]['color']
+
     def map_grid(self, values: np.ndarray) -> List[List[str]]:
         """
-        Map a 2D grid of values to colors
-        
-        Args:
-            values: 2D numpy array of numerical values
-            
-        Returns:
-            2D list of hex color strings
+        Map entire grid to colors
         """
         rows, cols = values.shape
-        color_grid = []
-        
-        for i in range(rows):
-            color_row = []
-            for j in range(cols):
-                color = self.map_value(values[i, j])
-                color_row.append(color)
-            color_grid.append(color_row)
-        
-        return color_grid
-    
-    def map_grid_with_alpha(self, values: np.ndarray, alpha: float = 0.7) -> List[List[str]]:
+        return [
+            [self.map_value(values[i, j]) for j in range(cols)]
+            for i in range(rows)
+        ]
+
+    def map_grid_with_alpha(self, values: np.ndarray, alpha: float = 0.8) -> List[List[str]]:
         """
-        Map a 2D grid of values to RGBA colors with transparency
-        
-        Args:
-            values: 2D numpy array of numerical values
-            alpha: Transparency value (0-1)
-            
-        Returns:
-            2D list of RGBA color strings
+        Map grid with transparency (for layered maps)
         """
         rows, cols = values.shape
-        color_grid = []
-        
+        grid = []
+
         for i in range(rows):
-            color_row = []
+            row = []
             for j in range(cols):
-                hex_color = self.map_value(values[i, j])
-                rgba_color = self._hex_to_rgba(hex_color, alpha)
-                color_row.append(rgba_color)
-            color_grid.append(color_row)
-        
-        return color_grid
-    
+                v = values[i, j]
+
+                if v is None or np.isnan(v):
+                    row.append(TRANSPARENT)
+                else:
+                    hex_color = self.map_value(v)
+                    if hex_color == TRANSPARENT:
+                        row.append(TRANSPARENT)
+                    else:
+                        row.append(self._hex_to_rgba(hex_color, alpha))
+            grid.append(row)
+
+        return grid
+
     @staticmethod
-    def _hex_to_rgba(hex_color: str, alpha: float = 1.0) -> str:
-        """
-        Convert hex color to rgba string
-        
-        Args:
-            hex_color: Hex color string (e.g., '#ffffff')
-            alpha: Alpha value (0-1)
-            
-        Returns:
-            RGBA string (e.g., 'rgba(255, 255, 255, 0.7)')
-        """
-        # Remove '#' if present
+    def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+        """Convert hex color to rgba with alpha"""
         hex_color = hex_color.lstrip('#')
-        
-        # Convert to RGB
         r = int(hex_color[0:2], 16)
         g = int(hex_color[2:4], 16)
         b = int(hex_color[4:6], 16)
-        
-        return f'rgba({r}, {g}, {b}, {alpha})'
-    
+        return f'rgba({r},{g},{b},{alpha})'
+
     def get_legend_items(self) -> List[Dict[str, Any]]:
         """
-        Get legend items for display
-        
-        Returns:
-            List of dicts with 'range', 'color', 'label' keys
+        Legend items for frontend display
         """
-        legend_items = []
-        
-        for item in self.color_scale:
-            legend_items.append({
+        return [
+            {
                 'min': item['min'],
                 'max': item['max'],
                 'color': item['color'],
-                'label': f"{item['min']}-{item['max']}"
-            })
-        
-        return legend_items
+                'label': f"{item['min']}–{item['max']}" if item['max'] < 999 else f">{item['min']}"
+            }
+            for item in self.color_scale
+        ]
 
+
+# ============================================================
+# RAINFALL – OFFICIAL KMD STANDARD (from your image)
+# ============================================================
 
 def get_rainfall_mapper() -> ColorMapper:
     """
-    Get color mapper for rainfall data (matches frontend exactly)
+    Official KMD rainfall color scale
+    
+    Key: 0 mm = WHITE (no rain), not transparent or gray
+    Based on "7 contours" table from operational standard
     """
     rainfall_scale = [
-        {'min': 0, 'max': 1, 'color': '#ffffff'},
-        {'min': 1, 'max': 2, 'color': '#d3ffbe'},
-        {'min': 2, 'max': 11, 'color': '#55ff00'},
-        {'min': 11, 'max': 21, 'color': '#73dfff'},
-        {'min': 21, 'max': 51, 'color': '#00a9e6'},
-        {'min': 51, 'max': 71, 'color': '#ffaa00'},
-        {'min': 71, 'max': 101, 'color': '#ff5a00'},
-        {'min': 101, 'max': 999, 'color': '#ff0000'},
+        # RGB values from your image
+        {'min': 0.0,   'max': 1.0,   'color': '#ffffff'},  # < 1mm - WHITE (R:255, G:255, B:255)
+        {'min': 1.0,   'max': 10.0,  'color': '#d3ff55'},  # 2-10 mm - Light green (R:211, G:255, B:85)
+        {'min': 10.0,  'max': 20.0,  'color': '#73ff55'},  # 11-20 mm - Green (R:115, G:255, B:85)
+        {'min': 20.0,  'max': 50.0,  'color': '#55dfff'},  # 21-50 mm - Light blue (R:85, G:223, B:255)
+        {'min': 50.0,  'max': 70.0,  'color': '#55a9ff'},  # 51-70 mm - Blue (R:85, G:169, B:255)
+        {'min': 70.0,  'max': 100.0, 'color': '#ffaa00'},  # 71-100 mm - Orange (R:255, G:170, B:0)
+        {'min': 100.0, 'max': 120.0, 'color': '#ff5500'},  # 101-120 mm - Dark orange (R:255, G:85, B:0)
+        {'min': 120.0, 'max': 9999,  'color': '#ff0000'},  # >121 mm - Red (R:255, G:0, B:0)
     ]
     return ColorMapper(rainfall_scale)
 
 
+# ============================================================
+# TEMPERATURE MAX – OFFICIAL KMD STANDARD
+# ============================================================
+
 def get_temp_max_mapper() -> ColorMapper:
     """
-    Get color mapper for maximum temperature (matches frontend exactly)
+    Official KMD maximum temperature color scale
+    Based on "Max" table from operational standard
+    
+    Note: All areas have color - no zero temperatures in Kenya
     """
     temp_max_scale = [
-        {'min': 0, 'max': 15, 'color': '#70a800'},
-        {'min': 15, 'max': 16, 'color': '#98e600'},
-        {'min': 16, 'max': 21, 'color': '#e6e600'},
-        {'min': 21, 'max': 26, 'color': '#ffaa00'},
-        {'min': 26, 'max': 31, 'color': '#ff5a00'},
-        {'min': 31, 'max': 36, 'color': '#c00000'},
-        {'min': 36, 'max': 50, 'color': '#800000'},
+        # RGB values from your image - "Max" table
+        {'min': 0.0,  'max': 15.0, 'color': '#70a800'},  # 0-15°C - Green (R:112, G:168, B:0)
+        {'min': 15.0, 'max': 20.0, 'color': '#98e600'},  # 16-20°C - Light green (R:152, G:230, B:0)
+        {'min': 20.0, 'max': 25.0, 'color': '#e6e600'},  # 21-25°C - Yellow (R:230, G:230, B:0)
+        {'min': 25.0, 'max': 30.0, 'color': '#ffaa00'},  # 26-30°C - Orange (R:255, G:170, B:0)
+        {'min': 30.0, 'max': 35.0, 'color': '#ff5a00'},  # 31-35°C - Dark orange (R:255, G:90, B:0)
+        {'min': 35.0, 'max': 9999, 'color': '#c00000'},  # >36°C - Red (R:192, G:0, B:0)
     ]
     return ColorMapper(temp_max_scale)
 
 
+# ============================================================
+# TEMPERATURE MIN – OFFICIAL KMD STANDARD
+# ============================================================
+
 def get_temp_min_mapper() -> ColorMapper:
     """
-    Get color mapper for minimum temperature (matches frontend exactly)
+    Official KMD minimum temperature color scale
+    Based on "Min" table from operational standard
+    
+    Note: All areas have color - no zero temperatures in Kenya
     """
     temp_min_scale = [
-        {'min': 0, 'max': 5, 'color': '#08306b'},
-        {'min': 5, 'max': 6, 'color': '#0066ff'},
-        {'min': 6, 'max': 11, 'color': '#00a884'},
-        {'min': 11, 'max': 16, 'color': '#70a800'},
-        {'min': 16, 'max': 21, 'color': '#98e600'},
-        {'min': 21, 'max': 26, 'color': '#e6e600'},
-        {'min': 26, 'max': 40, 'color': '#ffaa00'},
+        # RGB values from your image - "Min" table
+        {'min': 0.0,  'max': 5.0,  'color': '#00006b'},  # < 5°C - Dark blue (R:0, G:0, B:107)
+        {'min': 5.0,  'max': 10.0, 'color': '#0030ff'},  # 6-10°C - Blue (R:0, G:48, B:255)
+        {'min': 10.0, 'max': 15.0, 'color': '#00a8a8'},  # 11-15°C - Cyan (R:0, G:168, B:168)
+        {'min': 15.0, 'max': 20.0, 'color': '#70a800'},  # 16-20°C - Green (R:112, G:168, B:0)
+        {'min': 20.0, 'max': 25.0, 'color': '#98e600'},  # 21-25°C - Light green (R:152, G:230, B:0)
+        {'min': 25.0, 'max': 9999, 'color': '#e6e600'},  # >26°C - Yellow (R:230, G:230, B:0)
     ]
     return ColorMapper(temp_min_scale)
 
 
+# ============================================================
+# RELATIVE HUMIDITY (Generic - not in your image)
+# ============================================================
+
 def get_rh_mapper() -> ColorMapper:
     """
-    Get color mapper for relative humidity
+    Relative humidity color scale
+    Generic scale (not shown in operational standard image)
     """
     rh_scale = [
-        {'min': 0, 'max': 20, 'color': '#8B4513'},
-        {'min': 20, 'max': 40, 'color': '#D2691E'},
-        {'min': 40, 'max': 60, 'color': '#F0E68C'},
-        {'min': 60, 'max': 80, 'color': '#90EE90'},
-        {'min': 80, 'max': 100, 'color': '#00CED1'},
+        {'min': 0,   'max': 20,  'color': '#8B4513'},  # 0-20% - Brown (dry)
+        {'min': 20,  'max': 40,  'color': '#D2691E'},  # 20-40% - Light brown
+        {'min': 40,  'max': 60,  'color': '#F0E68C'},  # 40-60% - Tan
+        {'min': 60,  'max': 80,  'color': '#90EE90'},  # 60-80% - Light green
+        {'min': 80,  'max': 100, 'color': '#00CED1'},  # 80-100% - Cyan (wet)
     ]
     return ColorMapper(rh_scale)
 
 
+# ============================================================
+# CAPE (Generic - not in your image)
+# ============================================================
+
 def get_cape_mapper() -> ColorMapper:
     """
-    Get color mapper for CAPE
+    CAPE (Convective Available Potential Energy) color scale
+    Generic scale for instability indication
     """
     cape_scale = [
-        {'min': 0, 'max': 500, 'color': '#E0E0E0'},
-        {'min': 500, 'max': 1000, 'color': '#FFFF99'},
-        {'min': 1000, 'max': 2000, 'color': '#FFCC66'},
-        {'min': 2000, 'max': 3000, 'color': '#FF9933'},
-        {'min': 3000, 'max': 5000, 'color': '#FF3333'},
-        {'min': 5000, 'max': 10000, 'color': '#CC0000'},
+        {'min': 0,    'max': 500,   'color': '#f0f0f0'},  # 0-500 - Light gray (stable)
+        {'min': 500,  'max': 1000,  'color': '#ffff99'},  # 500-1000 - Light yellow
+        {'min': 1000, 'max': 2000,  'color': '#ffcc66'},  # 1000-2000 - Yellow-orange
+        {'min': 2000, 'max': 3000,  'color': '#ff9933'},  # 2000-3000 - Orange
+        {'min': 3000, 'max': 5000,  'color': '#ff3333'},  # 3000-5000 - Red
+        {'min': 5000, 'max': 99999, 'color': '#cc0000'},  # >5000 - Dark red (very unstable)
     ]
     return ColorMapper(cape_scale)
 
 
+# ============================================================
+# PARAMETER ROUTER
+# ============================================================
+
 def get_mapper_for_parameter(parameter_code: str) -> ColorMapper:
     """
     Get the appropriate color mapper for a parameter
-    
-    Args:
-        parameter_code: Parameter code ('rainfall', 'temp-max', etc.)
-        
-    Returns:
-        ColorMapper instance
     """
     mappers = {
         'rainfall': get_rainfall_mapper,
@@ -227,14 +226,6 @@ def get_mapper_for_parameter(parameter_code: str) -> ColorMapper:
         'rh': get_rh_mapper,
         'cape': get_cape_mapper,
     }
-    
-    mapper_func = mappers.get(parameter_code)
-    if mapper_func:
-        return mapper_func()
-    else:
-        # Return a default grayscale mapper
-        default_scale = [
-            {'min': 0, 'max': 100, 'color': '#ffffff'},
-            {'min': 100, 'max': 999999, 'color': '#000000'},
-        ]
-        return ColorMapper(default_scale)
+
+    mapper_func = mappers.get(parameter_code, get_rainfall_mapper)
+    return mapper_func()

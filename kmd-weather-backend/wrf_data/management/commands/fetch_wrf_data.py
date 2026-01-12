@@ -1,35 +1,37 @@
 """
 Django Management Command to Fetch WRF Data
+Production version with SSH key authentication
 File: wrf_data/management/commands/fetch_wrf_data.py
 
 Usage:
-    python manage.py fetch_wrf_data                    # Fetch today's data
-    python manage.py fetch_wrf_data --date 2024-12-15  # Fetch specific date
-    python manage.py fetch_wrf_data --force            # Force re-fetch existing data
+    python manage.py fetch_wrf_data --list                    # List available runs
+    python manage.py fetch_wrf_data --latest                  # Fetch latest run
+    python manage.py fetch_wrf_data --date 2025011219         # Fetch specific run (YYYYMMDDHH)
+    python manage.py fetch_wrf_data --domain kenya            # Fetch specific domain
 """
 
 from django.core.management.base import BaseCommand, CommandError
 from django.conf import settings
 from django.utils import timezone
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 
 from wrf_data.models import Domain, Parameter, ForecastRun, ForecastData, DataFetchLog
-from wrf_data.utils.ssh_fetcher import WRFDataFetcher
+from wrf_data.utils.ssh_fetcher import create_fetcher_from_config
 from wrf_data.utils.grib_processor import GRIBProcessor
 
 logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = 'Fetch and process WRF model data from remote server'
+    help = 'Fetch and process WRF GRIB files from remote server via SSH'
 
     def add_arguments(self, parser):
         parser.add_argument(
             '--date',
             type=str,
-            help='Date to fetch (YYYY-MM-DD format). Default: today',
+            help='Forecast run date in YYYYMMDDHH format (e.g., 2025011219). Default: yesterday at 19:00',
         )
         parser.add_argument(
             '--domain',
@@ -39,242 +41,428 @@ class Command(BaseCommand):
             help='Domain to fetch. Default: both',
         )
         parser.add_argument(
+            '--max-hours',
+            type=int,
+            default=72,
+            help='Maximum forecast hours to download (default: 72)',
+        )
+        parser.add_argument(
+            '--latest',
+            action='store_true',
+            help='Fetch the latest available run from server',
+        )
+        parser.add_argument(
+            '--list',
+            action='store_true',
+            help='List available runs on server without downloading',
+        )
+        parser.add_argument(
             '--force',
             action='store_true',
             help='Force re-fetch even if data already exists',
         )
-        parser.add_argument(
-            '--dry-run',
-            action='store_true',
-            help='Dry run - test connection and list files without downloading',
-        )
 
     def handle(self, *args, **options):
         """Main command handler"""
-        # Parse date
-        if options['date']:
+        
+        # List mode
+        if options['list']:
+            self.list_available_runs()
+            return
+        
+        # Determine run date
+        if options['latest']:
+            run_date = self.get_latest_run_date()
+        elif options['date']:
             try:
-                fetch_date = datetime.strptime(options['date'], '%Y-%m-%d').date()
+                run_date = datetime.strptime(options['date'], '%Y%m%d%H')
             except ValueError:
-                raise CommandError('Invalid date format. Use YYYY-MM-DD')
+                raise CommandError('Invalid date format. Use YYYYMMDDHH (e.g., 2025011219)')
         else:
-            fetch_date = timezone.now().date()
-
-        # Base time
-        base_time_str = settings.WRF_CONFIG.get('BASE_TIME', '09:00')
-        hour, minute = map(int, base_time_str.split(':'))
-        base_datetime = timezone.make_aware(
-            datetime.combine(fetch_date, datetime.min.time().replace(hour=hour, minute=minute))
-        )
-
-        self.stdout.write(self.style.SUCCESS(f'\n🌤️  KMD WRF Data Fetcher'))
-        self.stdout.write(self.style.SUCCESS('=' * 60))
-        self.stdout.write(f'Fetch Date: {fetch_date}')
-        self.stdout.write(f'Base Time: {base_datetime}')
-        self.stdout.write(f'Domain: {options["domain"]}')
-        self.stdout.write(f'Dry Run: {options["dry_run"]}')
-        self.stdout.write(self.style.SUCCESS('=' * 60 + '\n'))
-
-        # Check existing
-        if not options['force'] and ForecastRun.objects.filter(run_date=fetch_date, status='completed').exists():
-            self.stdout.write(self.style.WARNING(
-                f'⚠️  Data already exists for {fetch_date}. Use --force to re-fetch.'
-            ))
-            return
-
-        # Validate config
-        if not self._validate_config():
-            return
-
-        # Determine domains
-        domains = ['kenya', 'east-africa'] if options['domain'] == 'both' else [options['domain']]
-
-        # Forecast run
+            # Default: yesterday at 19:00 (7pm EAT)
+            yesterday = timezone.now().date() - timedelta(days=1)
+            run_date = datetime.combine(yesterday, datetime.strptime('19:00', '%H:%M').time())
+        
+        # Make timezone aware
+        run_date = timezone.make_aware(run_date)
+        
+        # Display header
+        self.stdout.write(self.style.SUCCESS('\n' + '=' * 70))
+        self.stdout.write(self.style.SUCCESS('🌤️  KMD WRF Data Fetcher - Production'))
+        self.stdout.write(self.style.SUCCESS('=' * 70))
+        self.stdout.write(f'Run Date:     {run_date.strftime("%Y-%m-%d %H:%M")}')
+        self.stdout.write(f'Domain:       {options["domain"]}')
+        self.stdout.write(f'Max Hours:    {options["max_hours"]}')
+        self.stdout.write(f'Force Fetch:  {options["force"]}')
+        self.stdout.write(self.style.SUCCESS('=' * 70 + '\n'))
+        
+        # Check if already exists
+        if not options['force']:
+            existing = ForecastRun.objects.filter(
+                run_date=run_date.date(),
+                run_time=run_date.time(),
+                status='completed'
+            ).exists()
+            
+            if existing:
+                self.stdout.write(self.style.WARNING(
+                    f'\n⚠️  Data already exists for {run_date.strftime("%Y%m%d%H")}.'
+                ))
+                self.stdout.write(self.style.WARNING(
+                    '   Use --force to re-fetch.\n'
+                ))
+                return
+        
+        # Create or update ForecastRun
         forecast_run, created = ForecastRun.objects.get_or_create(
-            run_date=fetch_date,
-            run_time=base_datetime.time(),
+            run_date=run_date.date(),
+            run_time=run_date.time(),
             defaults={
-                'initialization_time': base_datetime,
-                'forecast_hours': settings.WRF_CONFIG.get('FORECAST_HOURS', 72),
-                'status': 'pending',
+                'initialization_time': run_date,
+                'forecast_hours': options['max_hours'],
+                'status': 'fetching',
+                'progress': 0
             }
         )
-
-        if not created and not options['force']:
-            self.stdout.write(self.style.WARNING(f'Forecast run already exists (ID: {forecast_run.id})'))
-
-        forecast_run.status = 'fetching' if not options['dry_run'] else 'pending'
-        forecast_run.save()
-
-        # Process domains
-        for domain_code in domains:
-            self.stdout.write(f'\n📡 Processing domain: {domain_code.upper()}')
-            self.stdout.write('-' * 60)
-            try:
-                self._process_domain(
-                    forecast_run=forecast_run,
-                    domain_code=domain_code,
-                    base_datetime=base_datetime,
-                    dry_run=options['dry_run']
-                )
-            except Exception as e:
-                self.stderr.write(self.style.ERROR(f'❌ Error processing {domain_code}: {e}'))
-                logger.exception(f"Error processing domain {domain_code}")
-                forecast_run.status = 'failed'
-                forecast_run.error_message = str(e)
-                forecast_run.save()
-                raise
-
-        if not options['dry_run']:
-            forecast_run.status = 'completed'
-            forecast_run.completed_at = timezone.now()
-            forecast_run.progress = 100
+        
+        if not created:
+            forecast_run.status = 'fetching'
+            forecast_run.progress = 0
+            forecast_run.error_message = ''
             forecast_run.save()
-            self.stdout.write(self.style.SUCCESS(f'\n✅ Data fetch completed successfully!'))
-            self.stdout.write(f'Forecast Run ID: {forecast_run.id}')
+            self.stdout.write(f'Updating existing forecast run (ID: {forecast_run.id})\n')
         else:
-            self.stdout.write(self.style.SUCCESS(f'\n✅ Dry run completed!'))
-
-    def _validate_config(self):
-        """Validate WRF configuration"""
-        config = settings.WRF_CONFIG
-        required_fields = ['WRF_TARGET_HOST', 'WRF_TARGET_USERNAME']
-        missing = [f for f in required_fields if not config.get(f)]
-        if missing:
-            self.stderr.write(self.style.ERROR(f'❌ Missing required config: {", ".join(missing)}'))
-            return False
-
-        if not (config.get('WRF_TARGET_PASSWORD') or config.get('WRF_KEY_PATH')):
-            self.stderr.write(self.style.ERROR('❌ No authentication method configured (password or SSH key)'))
-            return False
-
-        self.stdout.write(self.style.SUCCESS('✓ Configuration validated'))
-        return True
-
-    def _process_domain(self, forecast_run, domain_code, base_datetime, dry_run=False):
-        """Process a single domain via jump host"""
-        try:
-            domain = Domain.objects.get(code=domain_code, is_active=True)
-        except Domain.DoesNotExist:
-            raise CommandError(f'Domain {domain_code} not found or inactive')
-
-        config = settings.WRF_CONFIG
-        remote_path = config['KENYA_PATH'] if domain_code == 'kenya' else config['EAST_AFRICA_PATH']
-        domain_suffix = config.get('KENYA_FILE_SUFFIX' if domain_code == 'kenya' else 'EAST_AFRICA_FILE_SUFFIX', '01')
-        local_path = Path(config['LOCAL_DATA_PATH']) / forecast_run.run_date.strftime('%Y%m%d')
-        local_path.mkdir(parents=True, exist_ok=True)
-
+            self.stdout.write(f'Created new forecast run (ID: {forecast_run.id})\n')
+        
+        # Create fetch log
         fetch_log = DataFetchLog.objects.create(
             forecast_run=forecast_run,
-            ssh_host=config['WRF_TARGET_HOST'],
-            ssh_user=config['WRF_TARGET_USERNAME'],
-            status='success' if dry_run else 'pending',
+            status='partial',
+            ssh_host=settings.WRF_CONFIG['SSH_HOST'],
+            ssh_user=settings.WRF_CONFIG['SSH_USERNAME']
         )
-
-        fetcher = WRFDataFetcher(
-            host=config['WRF_TARGET_HOST'],
-            port=config.get('WRF_TARGET_PORT', 22),
-            username=config['WRF_TARGET_USERNAME'],
-            password=config.get('WRF_TARGET_PASSWORD'),
-            jump_host=config.get('WRF_JUMP_HOST'),
-            jump_port=config.get('WRF_JUMP_PORT', 22),
-            jump_username=config.get('WRF_JUMP_USERNAME'),
-            jump_password=config.get('WRF_JUMP_PASSWORD'),
-        )
-
-        self.stdout.write('Connecting to WRF server via jump host...')
+        
         try:
+            # Initialize SSH fetcher
+            self.stdout.write('📡 Connecting to WRF server...')
+            fetcher = create_fetcher_from_config(settings.WRF_CONFIG)
+            
             with fetcher:
-                self.stdout.write(self.style.SUCCESS('✓ Connected to target server'))
-
-                file_list = fetcher.get_wrf_files_for_date(
-                    date=base_datetime,
-                    domain_suffix=domain_suffix,
-                    remote_base_path=remote_path,
-                    local_base_path=str(local_path),
-                    hours=config.get('FORECAST_HOURS', 72),
-                )
-
-                self.stdout.write(f'Found {len(file_list)} files to process')
-                fetch_log.files_requested = len(file_list)
-
-                if dry_run:
-                    self.stdout.write(self.style.WARNING('DRY RUN - Files that would be downloaded:'))
-                    for file_info in file_list[:5]:
-                        self.stdout.write(f"  - {file_info['remote']}")
-                    if len(file_list) > 5:
-                        self.stdout.write(f"  ... and {len(file_list) - 5} more")
+                self.stdout.write(self.style.SUCCESS('✓ Connected successfully\n'))
+                
+                # Check if run exists on server
+                if not fetcher.check_run_exists(run_date):
+                    error_msg = f"Run {run_date.strftime('%Y%m%d%H')} not found on server"
+                    self.stdout.write(self.style.ERROR(f'\n❌ {error_msg}\n'))
+                    
+                    # Show available runs
+                    self.stdout.write('📋 Available runs on server (last 10):')
+                    runs = fetcher.list_available_runs()
+                    for i, run in enumerate(runs[:10], 1):
+                        dt = datetime.strptime(run, '%Y%m%d%H')
+                        self.stdout.write(f'  {i:2d}. {run} → {dt.strftime("%Y-%m-%d %H:%M")}')
+                    
+                    fetch_log.status = 'failed'
+                    fetch_log.error_message = error_msg
+                    fetch_log.completed_at = timezone.now()
                     fetch_log.save()
-                    return
-
-                downloaded_count = 0
-                processed_count = 0
-                for i, file_info in enumerate(file_list):
-                    forecast_run.progress = int((i / len(file_list)) * 100)
+                    
+                    forecast_run.status = 'failed'
+                    forecast_run.error_message = error_msg
                     forecast_run.save()
-                    self.stdout.write(f'\n[{i+1}/{len(file_list)}] Processing T+{file_info["hour"]}h...')
-
-                    if fetcher.download_file(file_info['remote'], file_info['local']):
-                        downloaded_count += 1
-                        fetch_log.files_downloaded = downloaded_count
-                        fetch_log.save()
-                        try:
-                            self._process_grib_file(
-                                forecast_run, domain, file_info['local'], file_info['hour'] // 3, file_info['valid_time']
-                            )
-                            processed_count += 1
-                            self.stdout.write(self.style.SUCCESS('  ✓ Processed'))
-                        except Exception as e:
-                            self.stderr.write(self.style.ERROR(f'  ❌ Processing failed: {e}'))
-                            fetch_log.add_log(f'Processing failed for {file_info["local"]}: {e}', 'error')
-                    else:
-                        self.stderr.write(self.style.ERROR('  ❌ Download failed'))
-                        fetch_log.add_log(f'Download failed: {file_info["remote"]}', 'error')
-
+                    
+                    raise CommandError(error_msg)
+                
+                # Download GRIB files
+                self.stdout.write('📥 Downloading GRIB files...\n')
+                results = fetcher.download_forecast_run(
+                    run_date=run_date,
+                    domain=options['domain'],
+                    max_hours=options['max_hours']
+                )
+                
+                # Update fetch log
+                fetch_log.files_requested = results['total']
+                fetch_log.files_downloaded = len(results['success'])
                 fetch_log.completed_at = timezone.now()
-                fetch_log.status = 'success' if downloaded_count == len(file_list) else 'partial'
+                
+                # Calculate total bytes
+                total_bytes = sum(
+                    Path(f).stat().st_size for f in results['success'] 
+                    if Path(f).exists()
+                )
+                fetch_log.total_bytes = total_bytes
+                
+                if results['failed']:
+                    fetch_log.status = 'partial'
+                    fetch_log.error_message = f"{len(results['failed'])} files failed"
+                    self.stdout.write(self.style.WARNING(
+                        f'\n⚠️  Downloaded {len(results["success"])}/{results["total"]} files'
+                    ))
+                    for failed_file in results['failed']:
+                        self.stdout.write(self.style.ERROR(f'   ✗ {failed_file}'))
+                else:
+                    fetch_log.status = 'success'
+                    self.stdout.write(self.style.SUCCESS(
+                        f'\n✓ Successfully downloaded all {results["total"]} files '
+                        f'({total_bytes / (1024*1024):.1f} MB)\n'
+                    ))
+                
+                fetch_log.add_log(f"Downloaded {len(results['success'])}/{results['total']} files", 'info')
                 fetch_log.save()
-                self.stdout.write(self.style.SUCCESS(f'\n✅ Downloaded: {downloaded_count}/{len(file_list)} files'))
-                self.stdout.write(self.style.SUCCESS(f'✅ Processed: {processed_count} files'))
-
+                
+                # Update forecast run
+                forecast_run.progress = 50  # Files downloaded
+                forecast_run.files_downloaded = {
+                    'run_folder': results['run_folder'],
+                    'success': [str(Path(f).name) for f in results['success']],
+                    'failed': results['failed'],
+                    'total_bytes': total_bytes
+                }
+                forecast_run.save()
+                
+                # Process GRIB files
+                if results['success']:
+                    self.stdout.write('\n🔬 Processing GRIB files...\n')
+                    self.process_downloaded_files(
+                        forecast_run=forecast_run,
+                        file_list=results['success'],
+                        domain_filter=options['domain']
+                    )
+                
+                # Mark as completed
+                forecast_run.status = 'completed'
+                forecast_run.progress = 100
+                forecast_run.completed_at = timezone.now()
+                forecast_run.save()
+                
+                self.stdout.write(self.style.SUCCESS('\n' + '=' * 70))
+                self.stdout.write(self.style.SUCCESS(
+                    f'✅ Fetch complete! Files saved to: data/raw/{results["run_folder"]}'
+                ))
+                self.stdout.write(self.style.SUCCESS('=' * 70 + '\n'))
+                
         except Exception as e:
+            error_msg = str(e)
+            self.stdout.write(self.style.ERROR(f'\n❌ Error: {error_msg}\n'))
+            logger.exception("Fetch failed")
+            
             fetch_log.status = 'failed'
-            fetch_log.error_message = str(e)
+            fetch_log.error_message = error_msg
             fetch_log.completed_at = timezone.now()
             fetch_log.save()
-            raise
-
-    def _process_grib_file(self, forecast_run, domain, grib_path, time_step, valid_time):
-        """Process a single GRIB file and extract all parameters"""
+            
+            forecast_run.status = 'failed'
+            forecast_run.error_message = error_msg
+            forecast_run.save()
+            
+            raise CommandError(f'Fetch failed: {error_msg}')
+    
+    def list_available_runs(self):
+        """List available runs on the server"""
+        self.stdout.write(self.style.SUCCESS('\n📋 Listing available runs on server...\n'))
+        
+        try:
+            fetcher = create_fetcher_from_config(settings.WRF_CONFIG)
+            
+            with fetcher:
+                runs = fetcher.list_available_runs()
+                
+                if not runs:
+                    self.stdout.write(self.style.WARNING('No runs found on server'))
+                    return
+                
+                self.stdout.write(f'Found {len(runs)} runs:\n')
+                
+                for i, run in enumerate(runs[:20], 1):
+                    try:
+                        dt = datetime.strptime(run, '%Y%m%d%H')
+                        formatted = dt.strftime('%Y-%m-%d %H:%M')
+                        
+                        # Check if already fetched
+                        exists = ForecastRun.objects.filter(
+                            run_date=dt.date(),
+                            run_time=dt.time(),
+                            status='completed'
+                        ).exists()
+                        
+                        status_icon = '✓' if exists else ' '
+                        self.stdout.write(f'  [{status_icon}] {i:2d}. {run} → {formatted}')
+                    except:
+                        self.stdout.write(f'      {i:2d}. {run}')
+                
+                if len(runs) > 20:
+                    self.stdout.write(f'\n... and {len(runs) - 20} more')
+                
+                self.stdout.write('\n')
+                
+        except Exception as e:
+            raise CommandError(f'Failed to list runs: {e}')
+    
+    def get_latest_run_date(self) -> datetime:
+        """Get the latest run date from server"""
+        self.stdout.write('🔍 Finding latest run on server...')
+        
+        try:
+            fetcher = create_fetcher_from_config(settings.WRF_CONFIG)
+            
+            with fetcher:
+                latest_folder = fetcher.get_latest_run_folder()
+                
+                if not latest_folder:
+                    raise CommandError('No runs found on server')
+                
+                run_date = datetime.strptime(latest_folder, '%Y%m%d%H')
+                self.stdout.write(self.style.SUCCESS(
+                    f'✓ Latest run: {latest_folder} ({run_date.strftime("%Y-%m-%d %H:%M")})\n'
+                ))
+                
+                return run_date
+                
+        except Exception as e:
+            raise CommandError(f'Failed to get latest run: {e}')
+    
+    def process_downloaded_files(self, forecast_run, file_list, domain_filter):
+        """
+        Process all downloaded GRIB files
+        
+        Args:
+            forecast_run: ForecastRun instance
+            file_list: List of local file paths
+            domain_filter: 'kenya', 'east-africa', or 'both'
+        """
+        total_files = len(file_list)
+        processed_count = 0
+        failed_count = 0
+        
+        # Get active parameters from database
         parameters = Parameter.objects.filter(is_active=True)
-        with GRIBProcessor(grib_path) as processor:
-            for parameter in parameters:
+        
+        for i, grib_file in enumerate(file_list, 1):
+            file_path = Path(grib_file)
+            filename = file_path.name
+            
+            # Parse filename: WRFPRS_d01.00 or WRFPRS_d02.15
+            try:
+                parts = filename.split('.')
+                if len(parts) != 2 or not parts[0].startswith('WRFPRS_d'):
+                    logger.warning(f"Skipping invalid filename: {filename}")
+                    continue
+                
+                domain_suffix = parts[0][-2:]  # '01' or '02'
+                hour = int(parts[1])           # 0, 1, 2, ..., 72
+                
+                # Determine domain
+                domain_code = 'kenya' if domain_suffix == '01' else 'east-africa'
+                
+                # Skip if not in domain filter
+                if domain_filter != 'both' and domain_filter != domain_code:
+                    continue
+                
+                # Get domain from database
                 try:
-                    data = processor.extract_parameter(parameter_code=parameter.code, apply_color_mapping=True)
-                    if not data:
-                        logger.warning(f'No data extracted for {parameter.code}')
+                    domain = Domain.objects.get(code=domain_code, is_active=True)
+                except Domain.DoesNotExist:
+                    logger.error(f"Domain {domain_code} not found in database")
+                    failed_count += 1
+                    continue
+                
+                # Calculate time step (0-24 for 0-72 hours at 3-hour intervals)
+                time_step = hour // 3
+                
+                # Calculate valid time
+                valid_time = forecast_run.initialization_time + timedelta(hours=hour)
+                
+                self.stdout.write(
+                    f'  [{i:3d}/{total_files}] {filename} → {domain_code} T+{hour}h'
+                )
+                
+                # Process GRIB file
+                success = self.process_single_grib(
+                    forecast_run=forecast_run,
+                    domain=domain,
+                    grib_path=str(file_path),
+                    time_step=time_step,
+                    valid_time=valid_time,
+                    parameters=parameters
+                )
+                
+                if success:
+                    processed_count += 1
+                    self.stdout.write(self.style.SUCCESS('    ✓ Processed'))
+                else:
+                    failed_count += 1
+                    self.stdout.write(self.style.ERROR('    ✗ Failed'))
+                
+                # Update progress
+                progress = 50 + int((i / total_files) * 50)  # 50-100%
+                forecast_run.progress = progress
+                forecast_run.save()
+                
+            except Exception as e:
+                logger.error(f"Error processing {filename}: {e}")
+                failed_count += 1
+                self.stdout.write(self.style.ERROR(f'    ✗ Error: {e}'))
+        
+        self.stdout.write(self.style.SUCCESS(
+            f'\n✓ Processed {processed_count}/{total_files} files'
+        ))
+        if failed_count > 0:
+            self.stdout.write(self.style.WARNING(
+                f'⚠️  {failed_count} files failed processing'
+            ))
+    
+    def process_single_grib(self, forecast_run, domain, grib_path, time_step, valid_time, parameters):
+        """
+        Process a single GRIB file and extract all parameters
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with GRIBProcessor(grib_path) as processor:
+                for parameter in parameters:
+                    try:
+                        # Extract parameter from GRIB
+                        data = processor.extract_parameter(
+                            parameter_code=parameter.code,
+                            apply_color_mapping=True
+                        )
+                        
+                        if not data:
+                            logger.warning(
+                                f'No data extracted for {parameter.code} from {grib_path}'
+                            )
+                            continue
+                        
+                        # Save to database
+                        forecast_data, created = ForecastData.objects.update_or_create(
+                            forecast_run=forecast_run,
+                            domain=domain,
+                            parameter=parameter,
+                            time_step=time_step,
+                            defaults={
+                                'valid_time': valid_time,
+                                'grid_lats': data['lats'],
+                                'grid_lons': data['lons'],
+                                'values': data['values'],
+                                'color_data': data.get('color_data', []),
+                                'min_value': data['metadata'].get('min'),
+                                'max_value': data['metadata'].get('max'),
+                                'mean_value': data['metadata'].get('mean'),
+                                'source_file': grib_path,
+                            }
+                        )
+                        
+                        action = 'Created' if created else 'Updated'
+                        logger.debug(f'{action} {parameter.code} data for {domain.code} T+{time_step*3}h')
+                        
+                    except Exception as e:
+                        logger.error(f'Error extracting {parameter.code}: {e}')
                         continue
-
-                    forecast_data, created = ForecastData.objects.update_or_create(
-                        forecast_run=forecast_run,
-                        domain=domain,
-                        parameter=parameter,
-                        time_step=time_step,
-                        defaults={
-                            'valid_time': valid_time,
-                            'grid_lats': data['lats'],
-                            'grid_lons': data['lons'],
-                            'values': data['values'],
-                            'color_data': data.get('color_data', []),
-                            'min_value': data['metadata'].get('min'),
-                            'max_value': data['metadata'].get('max'),
-                            'mean_value': data['metadata'].get('mean'),
-                            'source_file': grib_path,
-                        }
-                    )
-                    action = 'Created' if created else 'Updated'
-                    self.stdout.write(f'    {action}: {parameter.code}')
-
-                except Exception as e:
-                    logger.error(f'Error processing {parameter.code}: {e}')
-                    self.stderr.write(self.style.ERROR(f'    ❌ {parameter.code}: {e}'))
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f'Error processing GRIB file {grib_path}: {e}')
+            return False

@@ -10,10 +10,12 @@ from rest_framework.permissions import AllowAny
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.db.models import Q, Max
+from django.core.cache import cache
 from datetime import datetime, timedelta
 import logging
 from rest_framework.decorators import api_view
 import numpy as np
+import random
 
 
 from .models import Domain, Parameter, ForecastRun, ForecastData, DataFetchLog
@@ -342,17 +344,34 @@ def ping(request):
 @api_view(['GET'])
 def get_raw_grib_data(request):
     """
-    Quick endpoint to test GRIB data extraction with color mapping
+    GRIB data extraction endpoint with stratified random sampling
+    Eliminates grid line artifacts by breaking regular sampling patterns
+    
     GET /api/test-grib/?parameter=rainfall&timestep=0&domain=kenya
     """
     from .utils.grib_processor import GRIBProcessor
     from .utils.color_mapper import get_mapper_for_parameter
     import os
     from django.conf import settings
+    import time
+    
+    start_time = time.time()
     
     parameter = request.GET.get('parameter', 'rainfall')
     timestep = int(request.GET.get('timestep', 0))
     domain = request.GET.get('domain', 'kenya')
+    
+    # Create cache key
+    cache_key = f'grib_data_{domain}_{parameter}_{timestep}_v2'  # v2 for new sampling
+    
+    # Check cache first (1 hour TTL)
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        cache_time = time.time() - start_time
+        logger.info(f'✓ Cache HIT: {cache_key} ({cache_time*1000:.0f}ms)')
+        return Response(cached_data)
+    
+    logger.info(f'✗ Cache MISS: {cache_key} - Processing GRIB file')
     
     # Determine domain suffix
     domain_suffix = '01' if domain == 'kenya' else '02'
@@ -370,62 +389,126 @@ def get_raw_grib_data(request):
     grib_file = os.path.join(data_dir, latest_date, f'WRFPRS_d{domain_suffix}.{timestep:02d}')
     
     if not os.path.exists(grib_file):
-        return Response({'error': f'GRIB file not found: {grib_file}'}, status=status.HTTP_404_NOT_FOUND)
+        available_files = []
+        date_dir = os.path.join(data_dir, latest_date)
+        if os.path.exists(date_dir):
+            available_files = sorted([f for f in os.listdir(date_dir) if f.startswith('WRFPRS')])
+        
+        return Response({
+            'error': f'GRIB file not found: WRFPRS_d{domain_suffix}.{timestep:02d}',
+            'available_files': available_files,
+            'help': f'Only {len(available_files)} timesteps available for {latest_date}'
+        }, status=status.HTTP_404_NOT_FOUND)
     
     try:
+        # Get color mapper first (before opening GRIB)
+        mapper = get_mapper_for_parameter(parameter)
+        
+        # Base downsampling factor
+        base_step = 10 if domain == 'kenya' else 6
+        
+        grib_start = time.time()
+        
         with GRIBProcessor(grib_file) as processor:
             data = processor.extract_parameter(parameter, apply_color_mapping=False)
             
             if not data:
-                return Response({'error': f'Parameter {parameter} not found in GRIB file'}, status=status.HTTP_404_NOT_FOUND)
+                return Response({
+                    'error': f'Parameter {parameter} not found in GRIB file'
+                }, status=status.HTTP_404_NOT_FOUND)
+        
+        grib_time = time.time() - grib_start
+        logger.info(f'  GRIB extraction: {grib_time*1000:.0f}ms')
+        
+        process_start = time.time()
+        
+        lats = np.array(data['lats'])
+        lons = np.array(data['lons'])
+        values = np.array(data['values'])
+        
+        # STRATIFIED RANDOM SAMPLING - Eliminates grid line artifacts!
+        points = []
+        rows, cols = lats.shape
+        
+        logger.info(f'  Using stratified random sampling (base_step={base_step})')
+        
+        # Divide into grid cells, sample randomly within each cell
+        for i in range(0, rows - base_step, base_step):
+            for j in range(0, cols - base_step, base_step):
+                # Randomly pick one point within this grid cell
+                sample_i = i + random.randint(0, base_step - 1)
+                sample_j = j + random.randint(0, base_step - 1)
+                
+                # Ensure we don't go out of bounds
+                sample_i = min(sample_i, rows - 1)
+                sample_j = min(sample_j, cols - 1)
+                
+                lat = float(lats[sample_i, sample_j])
+                lon = float(lons[sample_i, sample_j])
+                value = float(values[sample_i, sample_j])
+                
+                if not np.isnan(value):
+                    color = mapper.map_value(value)
+                    points.append({
+                        'lat': lat,
+                        'lon': lon,
+                        'value': value,
+                        'color': color
+                    })
+        
+        # Add extra random points for better coverage (10% more)
+        extra_samples = max(50, int(len(points) * 0.1))
+        logger.info(f'  Adding {extra_samples} extra random points')
+        
+        for _ in range(extra_samples):
+            rand_i = random.randint(0, rows - 1)
+            rand_j = random.randint(0, cols - 1)
             
-            # Get color mapper for this parameter
-            mapper = get_mapper_for_parameter(parameter)
+            lat = float(lats[rand_i, rand_j])
+            lon = float(lons[rand_i, rand_j])
+            value = float(values[rand_i, rand_j])
             
-            # Downsample for faster transfer (take every 5th point for Kenya, 3rd for East Africa)
-            step = 5 if domain == 'kenya' else 3
-            
-            lats = np.array(data['lats'])
-            lons = np.array(data['lons'])
-            values = np.array(data['values'])
-            
-            lats_sampled = lats[::step, ::step]
-            lons_sampled = lons[::step, ::step]
-            values_sampled = values[::step, ::step]
-            
-            # Convert to list of points for frontend with pre-computed colors
-            points = []
-            for i in range(lats_sampled.shape[0]):
-                for j in range(lats_sampled.shape[1]):
-                    value = values_sampled[i, j]
-                    if not np.isnan(value):
-                        color = mapper.map_value(value)
-                        points.append({
-                            'lat': float(lats_sampled[i, j]),
-                            'lon': float(lons_sampled[i, j]),
-                            'value': float(value),
-                            'color': color  # Pre-computed color from backend
-                        })
-            
-            return Response({
-                'success': True,
-                'file': grib_file,
-                'parameter': parameter,
-                'timestep': timestep,
-                'domain': domain,
-                'points': points,
-                'metadata': {
-                    'name': processor.PARAMETER_MAPPING[parameter]['name'],
-                    'unit': data['metadata'].get('units', 'unknown'),
-                    'min_value': data['metadata']['min'],
-                    'max_value': data['metadata']['max'],
-                    'mean_value': data['metadata']['mean'],
-                    'original_shape': [lats.shape[0], lats.shape[1]],
-                    'sampled_shape': [lats_sampled.shape[0], lons_sampled.shape[1]],
-                    'total_points': len(points)
-                },
-                'legend': mapper.get_legend_items()  # Color scale legend
-            })
+            if not np.isnan(value):
+                color = mapper.map_value(value)
+                points.append({
+                    'lat': lat,
+                    'lon': lon,
+                    'value': value,
+                    'color': color
+                })
+        
+        process_time = time.time() - process_start
+        logger.info(f'  Data processing: {process_time*1000:.0f}ms')
+        
+        response_data = {
+            'success': True,
+            'file': os.path.basename(grib_file),
+            'parameter': parameter,
+            'timestep': timestep,
+            'domain': domain,
+            'points': points,
+            'metadata': {
+                'name': processor.PARAMETER_MAPPING[parameter]['name'],
+                'unit': data['metadata'].get('units', 'unknown'),
+                'min_value': float(data['metadata']['min']),
+                'max_value': float(data['metadata']['max']),
+                'mean_value': float(data['metadata']['mean']),
+                'original_shape': [int(lats.shape[0]), int(lats.shape[1])],
+                'total_points': len(points),
+                'downsample_factor': base_step,
+                'sampling_method': 'stratified_random'
+            },
+            'legend': mapper.get_legend_items()
+        }
+        
+        # Cache for 1 hour
+        cache.set(cache_key, response_data, 3600)
+        
+        total_time = time.time() - start_time
+        logger.info(f'✓ Complete: {cache_key} - {len(points)} points in {total_time*1000:.0f}ms (cached)')
+        
+        return Response(response_data)
+        
     except Exception as e:
-        logger.error(f"Error processing GRIB: {e}", exc_info=True)
+        logger.error(f"✗ Error processing GRIB: {e}", exc_info=True)
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -72,3 +72,54 @@ node_modules/
 # OS Files
 Thumbs.db
 ehthumbs.db
+
+
+# SSH Keys (NEVER COMMIT!)
+*.key
+*.pem
+*_rsa
+*_dsa
+*_ecdsa
+*_ed25519
+*.base64
+kmd_wrf_key*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Django
+*.log
+db.sqlite3
+db.sqlite3-journal
+/staticfiles/
+/media/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (local only)
+data/raw/
+data/processed/
+data/cache/
+data/logs/
+
+../venv/
