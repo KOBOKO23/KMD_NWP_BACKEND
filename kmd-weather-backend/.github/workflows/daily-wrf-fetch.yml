@@ -1,0 +1,81 @@
+name: Daily WRF Data Fetch
+
+on:
+  schedule:
+    # Run at 8:00 AM EAT (05:00 UTC) every day
+    - cron: '0 5 * * *'
+  
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Date to fetch (YYYY-MM-DD) - leave empty for latest'
+        required: false
+        type: string
+      domain:
+        description: 'Domain to fetch'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - kenya
+          - east-africa
+
+jobs:
+  fetch-wrf-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Trigger Railway fetch command
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          # Install Railway CLI
+          npm install -g @railway/cli
+          
+          # Login
+          railway login --token $RAILWAY_TOKEN
+          
+          # Link to project
+          railway link ${{ secrets.RAILWAY_PROJECT_ID }}
+          
+          # Fetch latest WRF data
+          if [ -z "${{ github.event.inputs.date }}" ]; then
+            railway run python manage.py fetch_wrf_data \
+              --latest \
+              --domain ${{ github.event.inputs.domain || 'both' }}
+          else
+            railway run python manage.py fetch_wrf_data \
+              --date ${{ github.event.inputs.date }} \
+              --domain ${{ github.event.inputs.domain || 'both' }}
+          fi
+      
+      - name: Cleanup old data
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          railway run python manage.py cleanup_old_data
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "WRF data fetch failed!"
+          # Add notification logic here (email, Slack, etc.)
+
+  # Optional: Weekly full sync
+  full-sync:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 2 * * 0'  # Sundays at 2 AM UTC
+    steps:
+      - name: Full data sync
+        run: |
+          # Fetch last 7 days of data to ensure completeness
+          for i in {1..7}; do
+            DATE=$(date -d "$i days ago" +%Y-%m-%d)
+            railway run python manage.py fetch_wrf_data --date $DATE --domain both
+          done

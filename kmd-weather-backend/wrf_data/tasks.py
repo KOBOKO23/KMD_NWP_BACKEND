@@ -1,21 +1,21 @@
 """
 Celery tasks for WRF data fetching and processing
 File: wrf_data/tasks.py
-
-This file should be placed in your Django backend at:
-kmd-weather-backend/wrf_data/tasks.py
+PRODUCTION VERSION
 """
 
 from celery import shared_task
 from django.utils import timezone
+from django.conf import settings
 from datetime import datetime, timedelta
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
 
 @shared_task(bind=True, max_retries=3)
-def fetch_and_process_wrf_data(self, date_str=None):
+def fetch_wrf_data_task(self, date_str=None):
     """
     Celery task to fetch and process WRF data from SSH server
     
@@ -25,10 +25,11 @@ def fetch_and_process_wrf_data(self, date_str=None):
     Returns:
         dict: Status information about the fetch operation
     """
-    from .models import ForecastRun, ForecastData, Domain, Parameter
-    from .utils.ssh_fetcher import SSHFetcher
+    from .models import ForecastRun, ForecastData, Domain, Parameter, DataFetchLog
+    from .utils.ssh_fetcher import create_fetcher_from_config
     from .utils.grib_processor import GRIBProcessor
-    from .utils.color_mapper import ColorMapper
+    from .utils.color_mapper import get_mapper_for_parameter
+    import numpy as np
     
     try:
         # Parse date
@@ -37,102 +38,184 @@ def fetch_and_process_wrf_data(self, date_str=None):
         else:
             fetch_date = timezone.now().date()
         
-        logger.info(f"Starting WRF data fetch for date: {fetch_date}")
+        # Set run time to 19:00 (7 PM EAT - when WRF runs)
+        run_time = datetime.strptime(settings.WRF_CONFIG['BASE_TIME'], '%H:%M').time()
+        run_datetime = datetime.combine(fetch_date, run_time)
+        
+        logger.info(f"🚀 Starting WRF data fetch for: {fetch_date} at {run_time}")
         
         # Create or get ForecastRun
         forecast_run, created = ForecastRun.objects.get_or_create(
             run_date=fetch_date,
+            run_time=run_time,
             defaults={
-                'status': 'processing',
-                'progress': 0
+                'status': 'fetching',
+                'progress': 0,
+                'initialization_time': timezone.make_aware(run_datetime),
+                'forecast_hours': settings.WRF_CONFIG['FORECAST_HOURS'],
             }
         )
         
         if not created:
-            forecast_run.status = 'processing'
+            forecast_run.status = 'fetching'
             forecast_run.progress = 0
+            forecast_run.error_message = ''
             forecast_run.save()
         
-        # Initialize utilities
-        ssh_fetcher = SSHFetcher()
-        grib_processor = GRIBProcessor()
-        color_mapper = ColorMapper()
+        # Create fetch log
+        fetch_log = DataFetchLog.objects.create(
+            forecast_run=forecast_run,
+            status='success',
+            ssh_host=settings.WRF_CONFIG['SSH_HOST'],
+            ssh_user=settings.WRF_CONFIG['SSH_USERNAME'],
+        )
         
-        # Get all domains and parameters
-        domains = Domain.objects.all()
-        parameters = Parameter.objects.all()
+        # Initialize SSH fetcher
+        fetcher = create_fetcher_from_config(settings.WRF_CONFIG)
         
-        total_steps = len(domains) * len(parameters) * 25  # 25 timesteps (0-72h at 3h intervals)
-        current_step = 0
+        # Download GRIB files
+        logger.info("📥 Connecting to SSH server...")
+        download_results = fetcher.download_forecast_run(
+            run_date=run_datetime,
+            domain='both',
+            max_hours=settings.WRF_CONFIG['FORECAST_HOURS']
+        )
         
-        # Fetch and process data for each domain and parameter
+        # Update fetch log
+        fetch_log.files_requested = download_results['total']
+        fetch_log.files_downloaded = len(download_results['success'])
+        fetch_log.completed_at = timezone.now()
+        
+        if len(download_results['failed']) > 0:
+            fetch_log.status = 'partial'
+            fetch_log.error_message = f"Failed to download {len(download_results['failed'])} files"
+        
+        fetch_log.save()
+        
+        # Update forecast run status
+        forecast_run.status = 'processing'
+        forecast_run.progress = 30
+        forecast_run.save()
+        
+        # Process downloaded GRIB files
+        logger.info("⚙️  Processing GRIB files...")
+        
+        domains = Domain.objects.filter(is_active=True)
+        parameters = Parameter.objects.filter(is_active=True)
+        
+        local_folder = settings.WRF_CONFIG['LOCAL_DATA_PATH'] / download_results['run_folder']
+        
+        processed_count = 0
+        total_steps = len(domains) * len(parameters) * 25  # 25 timesteps
+        
         for domain in domains:
-            logger.info(f"Processing domain: {domain.name}")
+            logger.info(f"  Processing domain: {domain.name}")
             
             for parameter in parameters:
-                logger.info(f"Processing parameter: {parameter.name}")
+                logger.info(f"    Processing parameter: {parameter.name}")
                 
-                try:
-                    # Construct remote file path
-                    # Example: /data/wrf/2024/01/15/kenya/rainfall/rainfall_000.grb2
-                    remote_base_path = f"/data/wrf/{fetch_date.year:04d}/{fetch_date.month:02d}/{fetch_date.day:02d}/{domain.code}/{parameter.code}"
+                # Track cumulative values for parameters that need it
+                previous_values = None
+                
+                for timestep in range(25):  # 0-72 hours at 3-hour intervals
+                    hour = timestep * 3
                     
-                    # Process each timestep (0 to 72 hours at 3-hour intervals)
-                    for timestep in range(25):  # 0, 3, 6, ..., 72
-                        hour = timestep * 3
+                    try:
+                        # Construct GRIB file path
+                        domain_suffix = domain.file_suffix
+                        grib_filename = f'WRFPRS_d{domain_suffix}.{hour:02d}'
+                        grib_file = local_folder / grib_filename
                         
-                        try:
-                            # Remote file path
-                            remote_file = f"{remote_base_path}/{parameter.code}_{hour:03d}.grb2"
-                            
-                            # Fetch GRIB file from SSH server
-                            local_file = ssh_fetcher.fetch_file(
-                                remote_path=remote_file,
-                                local_dir=f"data/raw/{fetch_date}/{domain.code}/{parameter.code}"
+                        if not grib_file.exists():
+                            logger.warning(f"      ⚠️  File not found: {grib_filename}")
+                            continue
+                        
+                        # Extract data from GRIB
+                        with GRIBProcessor(str(grib_file)) as processor:
+                            data = processor.extract_parameter(
+                                parameter.code,
+                                apply_color_mapping=False
                             )
-                            
-                            if local_file:
-                                # Process GRIB to GeoJSON
-                                geojson_data = grib_processor.process_grib_to_geojson(
-                                    grib_file=local_file,
-                                    parameter=parameter.code
-                                )
-                                
-                                # Apply color mapping
-                                colored_data = color_mapper.apply_colors(
-                                    geojson_data,
-                                    parameter=parameter.code
-                                )
-                                
-                                # Save to database
-                                ForecastData.objects.update_or_create(
-                                    forecast_run=forecast_run,
-                                    domain=domain,
-                                    parameter=parameter,
-                                    timestep=timestep,
-                                    defaults={
-                                        'data': colored_data,
-                                        'valid_time': forecast_run.run_date + timedelta(hours=hour)
-                                    }
-                                )
-                                
-                                logger.info(f"Successfully processed {domain.code}/{parameter.code} timestep {hour}h")
-                            else:
-                                logger.warning(f"Failed to fetch {remote_file}")
                         
-                        except Exception as e:
-                            logger.error(f"Error processing timestep {hour}h for {domain.code}/{parameter.code}: {str(e)}")
-                            # Continue with next timestep
+                        if not data:
+                            logger.warning(f"      ⚠️  No data extracted for {parameter.code}")
+                            continue
+                        
+                        # Get arrays
+                        lats = np.array(data['lats'])
+                        lons = np.array(data['lons'])
+                        values = np.array(data['values'])
+                        
+                        # Apply cumulative/running aggregation
+                        if parameter.code == 'rainfall':
+                            # Rainfall: cumulative sum
+                            if previous_values is None:
+                                previous_values = np.zeros_like(values)
+                            values = previous_values + values
+                            previous_values = values.copy()
+                        
+                        elif parameter.code == 'temp-max':
+                            # Max temperature: running maximum
+                            if previous_values is None:
+                                previous_values = values.copy()
+                            else:
+                                values = np.maximum(previous_values, values)
+                                previous_values = values.copy()
+                        
+                        elif parameter.code == 'temp-min':
+                            # Min temperature: running minimum
+                            if previous_values is None:
+                                previous_values = values.copy()
+                            else:
+                                values = np.minimum(previous_values, values)
+                                previous_values = values.copy()
+                        
+                        # Apply color mapping
+                        mapper = get_mapper_for_parameter(parameter.code)
+                        color_data = mapper.map_grid(values)
+                        
+                        # Calculate statistics
+                        valid_values = values[~np.isnan(values)]
+                        min_val = float(np.min(valid_values)) if len(valid_values) > 0 else None
+                        max_val = float(np.max(valid_values)) if len(valid_values) > 0 else None
+                        mean_val = float(np.mean(valid_values)) if len(valid_values) > 0 else None
+                        
+                        # Calculate valid time
+                        valid_time = timezone.make_aware(
+                            run_datetime + timedelta(hours=hour)
+                        )
+                        
+                        # Save to database
+                        ForecastData.objects.update_or_create(
+                            forecast_run=forecast_run,
+                            domain=domain,
+                            parameter=parameter,
+                            time_step=timestep,
+                            defaults={
+                                'valid_time': valid_time,
+                                'grid_lats': lats.tolist(),
+                                'grid_lons': lons.tolist(),
+                                'values': values.tolist(),
+                                'color_data': color_data,
+                                'min_value': min_val,
+                                'max_value': max_val,
+                                'mean_value': mean_val,
+                                'source_file': grib_filename,
+                            }
+                        )
+                        
+                        processed_count += 1
                         
                         # Update progress
-                        current_step += 1
-                        progress = int((current_step / total_steps) * 100)
+                        progress = 30 + int((processed_count / total_steps) * 70)
                         forecast_run.progress = progress
                         forecast_run.save()
-                
-                except Exception as e:
-                    logger.error(f"Error processing parameter {parameter.code}: {str(e)}")
-                    # Continue with next parameter
+                        
+                        logger.info(f"      ✓ Processed T+{hour}h")
+                    
+                    except Exception as e:
+                        logger.error(f"      ❌ Error processing timestep {hour}h: {e}")
+                        continue
         
         # Mark as completed
         forecast_run.status = 'completed'
@@ -140,17 +223,19 @@ def fetch_and_process_wrf_data(self, date_str=None):
         forecast_run.completed_at = timezone.now()
         forecast_run.save()
         
-        logger.info(f"WRF data fetch completed for {fetch_date}")
+        logger.info(f"✅ WRF data fetch completed for {fetch_date}")
+        logger.info(f"   Processed {processed_count} data points")
         
         return {
             'status': 'success',
             'date': fetch_date.isoformat(),
             'forecast_run_id': forecast_run.id,
+            'processed_count': processed_count,
             'message': f'Successfully fetched and processed WRF data for {fetch_date}'
         }
     
     except Exception as e:
-        logger.error(f"Error in fetch_and_process_wrf_data: {str(e)}")
+        logger.error(f"❌ Error in fetch_wrf_data_task: {e}", exc_info=True)
         
         # Update forecast run status
         if 'forecast_run' in locals():
@@ -158,14 +243,21 @@ def fetch_and_process_wrf_data(self, date_str=None):
             forecast_run.error_message = str(e)
             forecast_run.save()
         
+        # Update fetch log
+        if 'fetch_log' in locals():
+            fetch_log.status = 'failed'
+            fetch_log.error_message = str(e)
+            fetch_log.completed_at = timezone.now()
+            fetch_log.save()
+        
         # Retry task
         raise self.retry(exc=e, countdown=300)  # Retry after 5 minutes
 
 
 @shared_task
-def cleanup_old_forecasts(days_to_keep=7):
+def cleanup_old_data(days_to_keep=7):
     """
-    Clean up old forecast data to save disk space
+    Clean up old forecast data and GRIB files
     
     Args:
         days_to_keep: Number of days of data to retain
@@ -175,20 +267,39 @@ def cleanup_old_forecasts(days_to_keep=7):
     try:
         cutoff_date = timezone.now().date() - timedelta(days=days_to_keep)
         
+        # Delete old forecast runs (cascade deletes ForecastData)
         old_runs = ForecastRun.objects.filter(run_date__lt=cutoff_date)
         count = old_runs.count()
         old_runs.delete()
         
-        logger.info(f"Cleaned up {count} old forecast runs")
+        # Delete old GRIB files
+        data_path = settings.WRF_CONFIG['LOCAL_DATA_PATH']
+        deleted_folders = 0
+        
+        if data_path.exists():
+            for folder in data_path.iterdir():
+                if folder.is_dir() and len(folder.name) == 10:  # YYYYMMDDHH format
+                    try:
+                        folder_date = datetime.strptime(folder.name[:8], '%Y%m%d').date()
+                        if folder_date < cutoff_date:
+                            import shutil
+                            shutil.rmtree(folder)
+                            deleted_folders += 1
+                            logger.info(f"Deleted old GRIB folder: {folder.name}")
+                    except Exception as e:
+                        logger.warning(f"Error deleting folder {folder.name}: {e}")
+        
+        logger.info(f"✅ Cleanup complete: {count} forecast runs, {deleted_folders} GRIB folders")
         
         return {
             'status': 'success',
-            'deleted_count': count,
+            'deleted_runs': count,
+            'deleted_folders': deleted_folders,
             'cutoff_date': cutoff_date.isoformat()
         }
     
     except Exception as e:
-        logger.error(f"Error in cleanup_old_forecasts: {str(e)}")
+        logger.error(f"❌ Error in cleanup_old_data: {e}", exc_info=True)
         raise
 
 
@@ -196,127 +307,7 @@ def cleanup_old_forecasts(days_to_keep=7):
 def daily_forecast_fetch():
     """
     Daily scheduled task to fetch latest WRF data
-    Run this task every day at 10:00 AM EAT (after model run completes)
+    Run this task every day at 10:00 PM EAT (3 hours after model run at 7 PM)
     """
-    from django.utils import timezone
-    
     today = timezone.now().date()
-    return fetch_and_process_wrf_data.delay(today.isoformat())
-
-
-# Alternative: Synchronous version (if not using Celery)
-def fetch_and_process_wrf_data_sync(date_str=None):
-    """
-    Synchronous version of fetch_and_process_wrf_data
-    Use this if you don't have Celery set up
-    
-    Call from views.py like:
-        from .tasks import fetch_and_process_wrf_data_sync
-        result = fetch_and_process_wrf_data_sync(fetch_date.isoformat())
-    """
-    from .models import ForecastRun, ForecastData, Domain, Parameter
-    from .utils.ssh_fetcher import SSHFetcher
-    from .utils.grib_processor import GRIBProcessor
-    from .utils.color_mapper import ColorMapper
-    
-    try:
-        # Parse date
-        if date_str:
-            fetch_date = datetime.fromisoformat(date_str).date()
-        else:
-            fetch_date = timezone.now().date()
-        
-        logger.info(f"Starting WRF data fetch for date: {fetch_date}")
-        
-        # Create or get ForecastRun
-        forecast_run, created = ForecastRun.objects.get_or_create(
-            run_date=fetch_date,
-            defaults={
-                'status': 'processing',
-                'progress': 0
-            }
-        )
-        
-        if not created:
-            forecast_run.status = 'processing'
-            forecast_run.progress = 0
-            forecast_run.save()
-        
-        # Initialize utilities
-        ssh_fetcher = SSHFetcher()
-        grib_processor = GRIBProcessor()
-        color_mapper = ColorMapper()
-        
-        # Get all domains and parameters
-        domains = Domain.objects.all()
-        parameters = Parameter.objects.all()
-        
-        total_steps = len(domains) * len(parameters) * 25
-        current_step = 0
-        
-        # Process data
-        for domain in domains:
-            for parameter in parameters:
-                remote_base_path = f"/data/wrf/{fetch_date.year:04d}/{fetch_date.month:02d}/{fetch_date.day:02d}/{domain.code}/{parameter.code}"
-                
-                for timestep in range(25):
-                    hour = timestep * 3
-                    
-                    try:
-                        remote_file = f"{remote_base_path}/{parameter.code}_{hour:03d}.grb2"
-                        
-                        local_file = ssh_fetcher.fetch_file(
-                            remote_path=remote_file,
-                            local_dir=f"data/raw/{fetch_date}/{domain.code}/{parameter.code}"
-                        )
-                        
-                        if local_file:
-                            geojson_data = grib_processor.process_grib_to_geojson(
-                                grib_file=local_file,
-                                parameter=parameter.code
-                            )
-                            
-                            colored_data = color_mapper.apply_colors(
-                                geojson_data,
-                                parameter=parameter.code
-                            )
-                            
-                            ForecastData.objects.update_or_create(
-                                forecast_run=forecast_run,
-                                domain=domain,
-                                parameter=parameter,
-                                timestep=timestep,
-                                defaults={
-                                    'data': colored_data,
-                                    'valid_time': forecast_run.run_date + timedelta(hours=hour)
-                                }
-                            )
-                    
-                    except Exception as e:
-                        logger.error(f"Error processing timestep {hour}h: {str(e)}")
-                    
-                    current_step += 1
-                    forecast_run.progress = int((current_step / total_steps) * 100)
-                    forecast_run.save()
-        
-        # Mark as completed
-        forecast_run.status = 'completed'
-        forecast_run.progress = 100
-        forecast_run.completed_at = timezone.now()
-        forecast_run.save()
-        
-        return {
-            'status': 'success',
-            'date': fetch_date.isoformat(),
-            'forecast_run_id': forecast_run.id
-        }
-    
-    except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        
-        if 'forecast_run' in locals():
-            forecast_run.status = 'failed'
-            forecast_run.error_message = str(e)
-            forecast_run.save()
-        
-        raise
+    return fetch_wrf_data_task.delay(today.isoformat())

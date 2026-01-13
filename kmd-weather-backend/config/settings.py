@@ -1,5 +1,5 @@
 """
-Django settings for KMD WRF Backend
+Django settings for KMD WRF Backend - PRODUCTION VERSION
 """
 
 import os
@@ -7,14 +7,11 @@ from pathlib import Path
 import environ
 import dj_database_url
 
-
 # Build paths inside the project
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Initialize environment variables
-env = environ.Env(
-    DEBUG=(bool, False)
-)
+env = environ.Env(DEBUG=(bool, False))
 
 # Read .env file
 environ.Env.read_env(os.path.join(BASE_DIR, '.env'))
@@ -44,7 +41,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'corsheaders.middleware.CorsMiddleware',  # Must be before CommonMiddleware
+    'whitenoise.middleware.WhiteNoiseMiddleware',  # For static files
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -73,17 +71,23 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
+# ============================================
 # Database Configuration
+# ============================================
 DATABASES = {
     'default': {
-        'ENGINE': env('DB_ENGINE', default='django.db.backends.sqlite3'),
-        'NAME': env('DB_NAME', default=BASE_DIR / 'db.sqlite3'),
-        'USER': env('DB_USER', default=''),
-        'PASSWORD': env('DB_PASSWORD', default=''),
-        'HOST': env('DB_HOST', default=''),
-        'PORT': env('DB_PORT', default=''),
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
+
+# Use PostgreSQL in production (Railway)
+if not DEBUG or os.environ.get('DATABASE_URL'):
+    DATABASES['default'] = dj_database_url.config(
+        default=env('DATABASE_URL'),
+        conn_max_age=600,
+        conn_health_checks=True,
+    )
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -99,30 +103,32 @@ TIME_ZONE = env('WRF_TIMEZONE', default='Africa/Nairobi')
 USE_I18N = True
 USE_TZ = True
 
-# Static files (CSS, JavaScript, Images)
+# ============================================
+# Static Files (WhiteNoise)
+# ============================================
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-# STATICFILES_DIRS = [
- #   BASE_DIR / 'static'
- #   ]
- 
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
 # Media files
-MEDIA_URL = 'media/'
+MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# ============================================
 # CORS Configuration
+# ============================================
 CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=[
     'http://localhost:3000',
     'http://localhost:5173',
-    'http://127.0.0.1:3000',
 ])
-
 CORS_ALLOW_CREDENTIALS = True
 
+# ============================================
 # Django REST Framework Configuration
+# ============================================
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
@@ -143,108 +149,6 @@ REST_FRAMEWORK = {
     }
 }
 
-# ===============================
-# WRF Data Configuration
-# ===============================
-WRF_CONFIG = {
-    # Target SSH Server (GRIB)
-    'SSH_HOST': env('WRF_TARGET_HOST', default=''),
-    'SSH_PORT': env.int('WRF_TARGET_PORT', default=22),
-    'SSH_USERNAME': env('WRF_TARGET_USERNAME', default=''),
-    'SSH_PASSWORD': env('WRF_TARGET_PASSWORD', default=''),
-    'SSH_KEY_PATH': env('WRF_KEY_PATH', default=''),
-    'SSH_KEY_PASSWORD': env('WRF_KEY_PASSWORD', default=''),
-
-    # Jump Host (Gateway)
-    'JUMP_HOST': env('WRF_JUMP_HOST', default=''),
-    'JUMP_PORT': env.int('WRF_JUMP_PORT', default=22),
-    'JUMP_USERNAME': env('WRF_JUMP_USERNAME', default=''),
-    'JUMP_PASSWORD': env('WRF_JUMP_PASSWORD', default=''),
-
-    # Remote Paths
-    'REMOTE_BASE_PATH': env('WRF_REMOTE_GRIB_PATH', default='/data/wrf'),
-    'KENYA_PATH': env('WRF_KENYA_PATH', default='/data/wrf/kenya'),
-    'EAST_AFRICA_PATH': env('WRF_EAST_AFRICA_PATH', default='/data/wrf/east_africa'),
-
-    # Local Paths
-    'LOCAL_DATA_PATH': Path(BASE_DIR / env('LOCAL_DATA_PATH', default='data/raw')),
-    'PROCESSED_DATA_PATH': Path(BASE_DIR / env('PROCESSED_DATA_PATH', default='data/processed')),
-
-    # Model Configuration
-    'BASE_TIME': env('WRF_BASE_TIME', default='09:00'),
-    'TIMEZONE': env('WRF_TIMEZONE', default='Africa/Nairobi'),
-    'FORECAST_HOURS': env.int('WRF_FORECAST_HOURS', default=72),
-    'TIME_STEP_HOURS': env.int('WRF_TIME_STEP_HOURS', default=3),
-
-    # Data Retention
-    'KEEP_RAW_FILES_DAYS': env.int('KEEP_RAW_FILES_DAYS', default=7),
-    'KEEP_PROCESSED_FILES_DAYS': env.int('KEEP_PROCESSED_FILES_DAYS', default=30),
-
-    # File Naming Convention
-    'KENYA_FILE_PREFIX': 'wrfout_',
-    'KENYA_FILE_SUFFIX': '01',
-    'EAST_AFRICA_FILE_PREFIX': 'wrfout_',
-    'EAST_AFRICA_FILE_SUFFIX': '02',
-}
-
-# Ensure local directories exist
-for path in [WRF_CONFIG['LOCAL_DATA_PATH'], WRF_CONFIG['PROCESSED_DATA_PATH']]:
-    path.mkdir(parents=True, exist_ok=True)
-
-# Logging Configuration
-LOGGING = {
-    'version': 1,
-    'disable_existing_loggers': False,
-    'formatters': {
-        'verbose': {
-            'format': '{levelname} {asctime} {module} {message}',
-            'style': '{',
-        },
-    },
-    'handlers': {
-        'console': {
-            'class': 'logging.StreamHandler',
-            'formatter': 'verbose',
-        },
-        'file': {
-            'class': 'logging.FileHandler',
-            'filename': env('LOG_FILE', default='logs/kmd_backend.log'),
-            'formatter': 'verbose',
-        },
-    },
-    'root': {
-        'handlers': ['console', 'file'],
-        'level': env('LOG_LEVEL', default='INFO'),
-    },
-    'loggers': {
-        'wrf_data': {
-            'handlers': ['console', 'file'],
-            'level': 'INFO',
-            'propagate': False,
-        },
-    },
-}
-
-# Cache configuration for GRIB data
-CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'wrf-grib-cache',
-        'OPTIONS': {
-            'MAX_ENTRIES': 200  # Cache up to 200 different requests
-        }
-    }
-}
-
-# Celery Configuration (for automated data fetching)
-CELERY_BROKER_URL = env('CELERY_BROKER_URL', default='redis://localhost:6379/0')
-CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default='redis://localhost:6379/0')
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'Africa/Nairobi'
-
-# Add at the top with other imports
 # ============================================
 # Persistent Storage Configuration
 # ============================================
@@ -258,21 +162,21 @@ else:
     DATA_ROOT = BASE_DIR / 'data'
 
 # ============================================
-# WRF Configuration (UPDATE THIS SECTION)
+# WRF Data Configuration
 # ============================================
 WRF_CONFIG = {
-    # Proxy Server (First Hop)
+    # Proxy Server (First Hop) - SSH Key Authentication
     'JUMP_HOST': env('WRF_JUMP_HOST', default=''),
     'JUMP_PORT': env.int('WRF_JUMP_PORT', default=22),
     'JUMP_USERNAME': env('WRF_JUMP_USERNAME', default=''),
-    'JUMP_PASSWORD': env('WRF_JUMP_PASSWORD', default=''),  # Optional, use key instead
+    'JUMP_PASSWORD': env('WRF_JUMP_PASSWORD', default=''),  # Optional
     'JUMP_SSH_KEY': env('WRF_JUMP_SSH_KEY_BASE64', default=''),  # Base64 encoded
 
-    # Target SSH Server (Second Hop)
+    # Target SSH Server (Second Hop) - SSH Key Authentication
     'SSH_HOST': env('WRF_TARGET_HOST', default=''),
     'SSH_PORT': env.int('WRF_TARGET_PORT', default=22),
     'SSH_USERNAME': env('WRF_TARGET_USERNAME', default=''),
-    'SSH_PASSWORD': env('WRF_TARGET_PASSWORD', default=''),  # Optional, use key instead
+    'SSH_PASSWORD': env('WRF_TARGET_PASSWORD', default=''),  # Optional
     'SSH_PRIVATE_KEY': env('WRF_SSH_PRIVATE_KEY_BASE64', default=''),  # Base64 encoded
 
     # Remote Paths
@@ -306,37 +210,30 @@ LOG_DIR = DATA_ROOT / 'logs'
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================
-# Production Database Configuration
+# Cache Configuration
 # ============================================
-if not DEBUG:
-    DATABASES['default'] = dj_database_url.config(
-        default=env('DATABASE_URL'),
-        conn_max_age=600,
-        conn_health_checks=True,
-    )
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'wrf-grib-cache',
+        'OPTIONS': {
+            'MAX_ENTRIES': 200
+        }
+    }
+}
 
 # ============================================
-# Static Files (WhiteNoise)
+# Celery Configuration
 # ============================================
-MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+CELERY_BROKER_URL = env('CELERY_BROKER_URL', default=env('REDIS_URL', default='redis://localhost:6379/0'))
+CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default=env('REDIS_URL', default='redis://localhost:6379/0'))
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'Africa/Nairobi'
 
 # ============================================
-# Security Settings (Production)
-# ============================================
-if not DEBUG:
-    SECURE_SSL_REDIRECT = True
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
-    SECURE_BROWSER_XSS_FILTER = True
-    SECURE_CONTENT_TYPE_NOSNIFF = True
-    X_FRAME_OPTIONS = 'DENY'
-    SECURE_HSTS_SECONDS = 31536000
-    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-    SECURE_HSTS_PRELOAD = True
-
-# ============================================
-# Logging Configuration (UPDATE)
+# Logging Configuration
 # ============================================
 LOGGING = {
     'version': 1,
@@ -381,6 +278,20 @@ LOGGING = {
         },
     },
 }
+
+# ============================================
+# Security Settings (Production)
+# ============================================
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_BROWSER_XSS_FILTER = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = 'DENY'
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
 
 # ============================================
 # Cron Security Token

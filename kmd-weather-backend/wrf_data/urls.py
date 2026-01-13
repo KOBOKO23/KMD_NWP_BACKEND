@@ -1,13 +1,14 @@
 """
 URL Configuration for WRF Data API
 File: wrf_data/urls.py
+PRODUCTION VERSION - Test endpoints removed
 """
 
-from . import views
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import ping
+
 from .views import (
+    ping,
     DomainViewSet,
     ParameterViewSet,
     ForecastRunViewSet,
@@ -27,7 +28,5 @@ app_name = 'wrf_data'
 
 urlpatterns = [
     path('', include(router.urls)),
-    path("ping/", ping),
-    path('test-grib/', views.get_raw_grib_data, name='test-grib'),
+    path('ping/', ping, name='ping'),
 ]
-
