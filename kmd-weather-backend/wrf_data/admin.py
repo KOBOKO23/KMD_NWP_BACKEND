@@ -7,7 +7,7 @@ from django.contrib import admin
 from django.utils.html import format_html
 from django.http import HttpResponse
 from .models import Domain, Parameter, ForecastRun, ForecastData, DataFetchLog
-from .tasks import fetch_and_process_wrf_data # for retry action
+from .tasks import fetch_wrf_data_task # for retry action
 from django.utils.safestring import mark_safe
 
 
@@ -333,7 +333,7 @@ class DataFetchLogAdmin(admin.ModelAdmin):
     # Actions
     def retry_fetch(self, request, queryset):
         for log in queryset:
-            fetch_and_process_wrf_data.delay(log.forecast_run.id)
+            fetch_wrf_data_task.delay(log.forecast_run.id)
         self.message_user(request, f"Retry task enqueued for {queryset.count()} logs")
     retry_fetch.short_description = "Retry Data Fetch"
 

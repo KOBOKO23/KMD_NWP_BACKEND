@@ -1,7 +1,7 @@
 """
 Django REST Framework Views for WRF Data API
+ON-DEMAND PROCESSING VERSION - No persistent storage required
 File: wrf_data/views.py
-PRODUCTION VERSION - All dummy data removed
 """
 
 from rest_framework import viewsets, status
@@ -14,19 +14,17 @@ from django.core.cache import cache
 from django.conf import settings
 from datetime import datetime, timedelta
 import logging
+import os
+import tempfile
+import shutil
+import numpy as np
 
 from .models import Domain, Parameter, ForecastRun, ForecastData, DataFetchLog
 from .serializers import (
     DomainSerializer,
     ParameterSerializer,
     ForecastRunListSerializer,
-    ForecastRunDetailSerializer,
-    ForecastDataSerializer,
-    ForecastDataMinimalSerializer,
     ForecastDataGridSerializer,
-    DataFetchLogSerializer,
-    ForecastDataRequestSerializer,
-    FetchTriggerSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,291 +35,281 @@ def ping(request):
     """Health check endpoint"""
     return Response({
         "status": "ok",
-        "message": "KMD Weather Backend is running",
+        "message": "KMD Weather Backend is running (On-Demand Mode)",
         "timestamp": timezone.now().isoformat(),
-        "version": "1.0.0"
+        "version": "2.0.0-on-demand"
     })
 
 
 class DomainViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ViewSet for Domain model
-    
-    list: Get all active domains
-    retrieve: Get a specific domain by ID
-    """
+    """ViewSet for Domain model"""
     queryset = Domain.objects.filter(is_active=True)
     serializer_class = DomainSerializer
     permission_classes = [AllowAny]
 
 
 class ParameterViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ViewSet for Parameter model
-    
-    list: Get all active parameters
-    retrieve: Get a specific parameter by ID
-    """
+    """ViewSet for Parameter model"""
     queryset = Parameter.objects.filter(is_active=True)
     serializer_class = ParameterSerializer
     permission_classes = [AllowAny]
 
 
 class ForecastRunViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ViewSet for ForecastRun model
-    
-    list: Get all forecast runs
-    retrieve: Get details of a specific forecast run
-    latest: Get the latest completed forecast run
-    """
+    """ViewSet for ForecastRun model"""
     queryset = ForecastRun.objects.all().order_by('-run_date', '-run_time')
+    serializer_class = ForecastRunListSerializer
     permission_classes = [AllowAny]
-    
-    def get_serializer_class(self):
-        """Use different serializers for list vs detail"""
-        if self.action == 'retrieve':
-            return ForecastRunDetailSerializer
-        return ForecastRunListSerializer
-    
-    def get_queryset(self):
-        """Filter by status if provided"""
-        queryset = super().get_queryset()
-        
-        status_filter = self.request.query_params.get('status', None)
-        if status_filter:
-            queryset = queryset.filter(status=status_filter)
-        
-        return queryset
     
     @action(detail=False, methods=['get'])
     def latest(self, request):
-        """
-        Get the latest completed forecast run with all available data
+        """Get metadata about the latest available forecast"""
+        # Get today's date and expected run time
+        today = timezone.now().date()
+        run_time = datetime.strptime(settings.WRF_CONFIG['BASE_TIME'], '%H:%M').time()
         
-        GET /api/forecasts/latest/
-        """
-        latest_run = ForecastRun.objects.filter(
-            status='completed'
-        ).order_by('-run_date', '-run_time').first()
-        
-        if not latest_run:
-            return Response(
-                {"detail": "No completed forecast runs available"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        # Get available domains and parameters
+        # Return available metadata
         domains = Domain.objects.filter(is_active=True)
         parameters = Parameter.objects.filter(is_active=True)
         
-        # Get available timesteps
-        timesteps = ForecastData.objects.filter(
-            forecast_run=latest_run
-        ).values_list('time_step', flat=True).distinct().order_by('time_step')
-        
-        # Count total data points
-        total_count = ForecastData.objects.filter(forecast_run=latest_run).count()
-        
         response_data = {
-            'forecast_run': ForecastRunListSerializer(latest_run).data,
+            'run_date': today.isoformat(),
+            'run_time': run_time.isoformat(),
             'domains': DomainSerializer(domains, many=True).data,
             'parameters': ParameterSerializer(parameters, many=True).data,
-            'available_timesteps': list(timesteps),
-            'total_data_count': total_count,
+            'available_timesteps': list(range(25)),  # 0-72 hours at 3-hour intervals
+            'mode': 'on-demand',
+            'note': 'Data is fetched and processed on-demand for each request'
         }
         
         return Response(response_data)
     
-    @action(detail=True, methods=['get'])
-    def data(self, request, pk=None):
+    @action(detail=False, methods=['get'])
+    def get_data(self, request):
         """
-        Get forecast data for a specific run, domain, parameter, and timestep
+        **ON-DEMAND DATA ENDPOINT**
+        Fetches, processes, and returns data in a single request
         
-        GET /api/forecasts/{id}/data/?domain=kenya&parameter=rainfall&timestep=0
+        GET /api/forecasts/get_data/?date=2025-01-13&domain=kenya&parameter=rainfall&timestep=0
+        
+        Query params:
+            - date: YYYY-MM-DD (default: today)
+            - domain: kenya or east-africa
+            - parameter: rainfall, temp-max, temp-min, rh, cape
+            - timestep: 0-24 (0-72 hours in 3-hour intervals)
+        
+        Returns:
+            Color-mapped grid data ready for visualization
         """
-        forecast_run = self.get_object()
+        # Parse and validate parameters
+        date_str = request.query_params.get('date', timezone.now().date().isoformat())
+        domain_code = request.query_params.get('domain')
+        parameter_code = request.query_params.get('parameter')
+        timestep = request.query_params.get('timestep')
         
-        # Validate request parameters
-        serializer = ForecastDataRequestSerializer(data=request.query_params)
-        serializer.is_valid(raise_exception=True)
-        
-        domain_code = serializer.validated_data['domain']
-        parameter_code = serializer.validated_data['parameter']
-        timestep = serializer.validated_data['timestep']
-        
-        # Get domain and parameter objects
-        domain = get_object_or_404(Domain, code=domain_code, is_active=True)
-        parameter = get_object_or_404(Parameter, code=parameter_code, is_active=True)
-        
-        # Get forecast data
-        forecast_data = get_object_or_404(
-            ForecastData,
-            forecast_run=forecast_run,
-            domain=domain,
-            parameter=parameter,
-            time_step=timestep
-        )
-        
-        # Serialize and return
-        data = ForecastDataGridSerializer(forecast_data).data
-        
-        return Response(data)
-    
-    @action(detail=False, methods=['post'])
-    def fetch(self, request):
-        """
-        Trigger a new data fetch from WRF server
-        
-        POST /api/forecasts/fetch/
-        Body:
-            {
-                "force": false,
-                "date": "2025-01-13"  // Optional: specific date (default: today)
-            }
-        
-        Requires: CRON_SECRET_TOKEN in Authorization header for security
-        """
-        # Security check
-        token = request.headers.get('Authorization', '').replace('Bearer ', '')
-        expected_token = settings.CRON_SECRET_TOKEN
-        
-        if token != expected_token:
+        if not all([domain_code, parameter_code, timestep is not None]):
             return Response({
-                "error": "Unauthorized - Invalid token"
-            }, status=status.HTTP_401_UNAUTHORIZED)
+                "error": "Missing required parameters",
+                "required": ["domain", "parameter", "timestep"],
+                "optional": ["date"]
+            }, status=status.HTTP_400_BAD_REQUEST)
         
-        serializer = FetchTriggerSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        force = serializer.validated_data.get('force', False)
-        fetch_date = serializer.validated_data.get('date', timezone.now().date())
-        
-        # Check if data already exists for this date
-        if not force:
-            existing_run = ForecastRun.objects.filter(
-                run_date=fetch_date,
-                status='completed'
-            ).exists()
-            
-            if existing_run:
-                return Response({
-                    "status": "skipped",
-                    "message": f"Data already exists for {fetch_date}. Use force=true to re-fetch."
-                })
-        
-        # Queue the fetch task
         try:
-            from .tasks import fetch_wrf_data_task
+            fetch_date = datetime.fromisoformat(date_str).date()
+            timestep = int(timestep)
             
-            # If Celery is available, use async task
-            if settings.CELERY_BROKER_URL:
-                task = fetch_wrf_data_task.delay(fetch_date.isoformat())
-                return Response({
-                    "status": "queued",
-                    "task_id": str(task.id),
-                    "date": fetch_date.isoformat(),
-                    "message": f"Data fetch queued for {fetch_date}"
-                })
-            else:
-                # Fallback to synchronous execution (not recommended for production)
-                logger.warning("Celery not configured - running fetch synchronously")
-                result = fetch_wrf_data_task(fetch_date.isoformat())
+            if timestep < 0 or timestep > 24:
+                raise ValueError("Timestep must be between 0 and 24")
                 
+        except ValueError as e:
+            return Response({
+                "error": f"Invalid parameter: {str(e)}"
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Validate domain and parameter exist
+        try:
+            domain = Domain.objects.get(code=domain_code, is_active=True)
+            parameter = Parameter.objects.get(code=parameter_code, is_active=True)
+        except Domain.DoesNotExist:
+            return Response({
+                "error": f"Domain '{domain_code}' not found"
+            }, status=status.HTTP_404_NOT_FOUND)
+        except Parameter.DoesNotExist:
+            return Response({
+                "error": f"Parameter '{parameter_code}' not found"
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Generate cache key
+        cache_key = f"wrf_data_{date_str}_{domain_code}_{parameter_code}_{timestep}"
+        
+        # Check cache first (15 minute TTL)
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            logger.info(f"✓ Cache hit: {cache_key}")
+            return Response(cached_data)
+        
+        logger.info(f"📊 Processing request: {fetch_date} | {domain_code} | {parameter_code} | T+{timestep*3}h")
+        
+        # Process data on-demand
+        try:
+            data = self._fetch_and_process(
+                fetch_date=fetch_date,
+                domain=domain,
+                parameter=parameter,
+                timestep=timestep
+            )
+            
+            if not data:
                 return Response({
-                    "status": "completed" if result else "failed",
-                    "date": fetch_date.isoformat(),
-                    "message": f"Data fetch {'completed' if result else 'failed'} for {fetch_date}"
-                })
+                    "error": "Failed to process data",
+                    "details": "Check server logs for more information"
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            # Cache the result (15 minutes)
+            cache.set(cache_key, data, 900)
+            
+            logger.info(f"✓ Successfully processed and cached: {cache_key}")
+            return Response(data)
             
         except Exception as e:
-            logger.error(f"Error triggering fetch: {e}", exc_info=True)
+            logger.error(f"❌ Error processing data: {e}", exc_info=True)
             return Response({
-                "status": "error",
-                "message": str(e)
+                "error": "Processing failed",
+                "details": str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def _fetch_and_process(self, fetch_date, domain, parameter, timestep):
+        """
+        Fetch GRIB file, process it, and return data
+        Uses temporary storage - files are deleted after processing
+        """
+        from .utils.ssh_fetcher import create_fetcher_from_config
+        from .utils.grib_processor import GRIBProcessor
+        from .utils.color_mapper import get_mapper_for_parameter
+        
+        temp_dir = None
+        
+        try:
+            # Create temporary directory
+            temp_dir = tempfile.mkdtemp(prefix='wrf_temp_')
+            logger.info(f"📁 Created temp directory: {temp_dir}")
+            
+            # Calculate run datetime
+            run_time = datetime.strptime(settings.WRF_CONFIG['BASE_TIME'], '%H:%M').time()
+            run_datetime = datetime.combine(fetch_date, run_time)
+            
+            # Calculate which GRIB file we need
+            forecast_hour = timestep * 3
+            grib_filename = f'WRFPRS_d{domain.file_suffix}.{forecast_hour:02d}'
+            
+            # Connect and download specific file
+            logger.info(f"📥 Fetching: {grib_filename}")
+            fetcher = create_fetcher_from_config(settings.WRF_CONFIG)
+            
+            if not fetcher.connect():
+                raise ConnectionError("Failed to connect to WRF server")
+            
+            try:
+                # Get remote path
+                folder_name = fetcher.get_forecast_folder_name(run_datetime)
+                remote_path = f"{fetcher.remote_archive_path}/{folder_name}/{grib_filename}"
+                local_path = os.path.join(temp_dir, grib_filename)
+                
+                # Download file
+                success = fetcher.download_file(remote_path, local_path)
+                
+                if not success:
+                    raise FileNotFoundError(f"Failed to download {grib_filename}")
+                
+                logger.info(f"✓ Downloaded to {local_path}")
+                
+            finally:
+                fetcher.disconnect()
+            
+            # Process GRIB file
+            logger.info(f"⚙️  Processing {grib_filename}")
+            
+            with GRIBProcessor(local_path) as processor:
+                extracted_data = processor.extract_parameter(
+                    parameter.code,
+                    apply_color_mapping=False
+                )
+            
+            if not extracted_data:
+                raise ValueError(f"No data extracted for {parameter.code}")
+            
+            # Get arrays
+            lats = np.array(extracted_data['lats'])
+            lons = np.array(extracted_data['lons'])
+            values = np.array(extracted_data['values'])
+            
+            # For cumulative parameters, we'd need to process all previous timesteps
+            # For demo purposes, we'll just return the current timestep
+            # TODO: Implement proper cumulative calculation if needed
+            
+            # Apply color mapping
+            mapper = get_mapper_for_parameter(parameter.code)
+            color_data = mapper.map_grid(values)
+            
+            # Calculate statistics
+            valid_values = values[~np.isnan(values)]
+            min_val = float(np.min(valid_values)) if len(valid_values) > 0 else None
+            max_val = float(np.max(valid_values)) if len(valid_values) > 0 else None
+            
+            # Calculate valid time
+            valid_time = timezone.make_aware(run_datetime + timedelta(hours=forecast_hour))
+            
+            # Prepare response
+            result = {
+                'domain': domain.code,
+                'parameter': parameter.code,
+                'parameter_name': parameter.name,
+                'unit': parameter.unit,
+                'time_step': timestep,
+                'valid_time': valid_time.isoformat(),
+                'grid_lats': lats.tolist(),
+                'grid_lons': lons.tolist(),
+                'color_data': color_data,
+                'min_value': min_val,
+                'max_value': max_val,
+                'color_scale': parameter.color_scale,
+            }
+            
+            return result
+            
+        finally:
+            # CRITICAL: Clean up temporary files
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    logger.info(f"🗑️  Cleaned up temp directory: {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp dir: {e}")
 
 
 class ForecastDataViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    ViewSet for ForecastData model
-    
-    list: Get all forecast data (with filtering)
-    retrieve: Get specific forecast data point
+    DEPRECATED - Use ForecastRunViewSet.get_data() instead
+    This viewset is kept for backwards compatibility
     """
-    queryset = ForecastData.objects.all().select_related(
-        'forecast_run', 'domain', 'parameter'
-    )
+    queryset = ForecastData.objects.none()
+    serializer_class = ForecastDataGridSerializer
     permission_classes = [AllowAny]
     
-    def get_serializer_class(self):
-        """Use minimal serializer for list, full for detail"""
-        if self.action == 'list':
-            return ForecastDataMinimalSerializer
-        return ForecastDataSerializer
-    
-    def get_queryset(self):
-        """
-        Filter forecast data by query parameters
-        
-        Query params:
-            - forecast_run: Forecast run ID
-            - domain: Domain code
-            - parameter: Parameter code
-            - timestep: Time step
-            - latest: If 'true', only return data from latest run
-        """
-        queryset = super().get_queryset()
-        
-        # Filter by latest run
-        if self.request.query_params.get('latest', '').lower() == 'true':
-            latest_run = ForecastRun.objects.filter(
-                status='completed'
-            ).order_by('-run_date', '-run_time').first()
-            
-            if latest_run:
-                queryset = queryset.filter(forecast_run=latest_run)
-        
-        # Filter by forecast run
-        forecast_run_id = self.request.query_params.get('forecast_run')
-        if forecast_run_id:
-            queryset = queryset.filter(forecast_run_id=forecast_run_id)
-        
-        # Filter by domain
-        domain_code = self.request.query_params.get('domain')
-        if domain_code:
-            queryset = queryset.filter(domain__code=domain_code)
-        
-        # Filter by parameter
-        parameter_code = self.request.query_params.get('parameter')
-        if parameter_code:
-            queryset = queryset.filter(parameter__code=parameter_code)
-        
-        # Filter by timestep
-        timestep = self.request.query_params.get('timestep')
-        if timestep is not None:
-            queryset = queryset.filter(time_step=int(timestep))
-        
-        return queryset.order_by('forecast_run', 'domain', 'parameter', 'time_step')
+    def list(self, request):
+        return Response({
+            "message": "This endpoint is deprecated. Use /api/forecasts/get_data/ instead",
+            "example": "/api/forecasts/get_data/?date=2025-01-13&domain=kenya&parameter=rainfall&timestep=0"
+        }, status=status.HTTP_410_GONE)
 
 
 class DataFetchLogViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ViewSet for DataFetchLog model
-    
-    list: Get all fetch logs
-    retrieve: Get specific fetch log
-    """
-    queryset = DataFetchLog.objects.all().order_by('-started_at')
-    serializer_class = DataFetchLogSerializer
+    """Minimal logging - not critical for on-demand mode"""
+    queryset = DataFetchLog.objects.all().order_by('-started_at')[:10]
     permission_classes = [AllowAny]
     
-    def get_queryset(self):
-        """Filter by status if provided"""
-        queryset = super().get_queryset()
-        
-        status_filter = self.request.query_params.get('status')
-        if status_filter:
-            queryset = queryset.filter(status=status_filter)
-        
-        return queryset
+    def list(self, request):
+        return Response({
+            "message": "Fetch logs are not maintained in on-demand mode",
+            "note": "Data is fetched and processed in real-time for each request"
+        })

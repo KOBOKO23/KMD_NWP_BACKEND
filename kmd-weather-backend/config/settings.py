@@ -1,11 +1,13 @@
 """
-Django settings for KMD WRF Backend - PRODUCTION VERSION
+Django settings for KMD WRF Backend
+ON-DEMAND PROCESSING VERSION - Optimized for Render free tier
 """
 
 import os
 from pathlib import Path
 import environ
 import dj_database_url
+import tempfile
 
 # Build paths inside the project
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -13,8 +15,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Initialize environment variables
 env = environ.Env(DEBUG=(bool, False))
 
-# Read .env file
-environ.Env.read_env(os.path.join(BASE_DIR, '.env'))
+# Read .env file if it exists
+env_file = os.path.join(BASE_DIR, '.env')
+if os.path.exists(env_file):
+    environ.Env.read_env(env_file)
 
 # Security Settings
 SECRET_KEY = env('SECRET_KEY', default='django-insecure-change-this-in-production')
@@ -41,7 +45,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',  # For static files
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -81,8 +85,8 @@ DATABASES = {
     }
 }
 
-# Use PostgreSQL in production (Railway)
-if not DEBUG or os.environ.get('DATABASE_URL'):
+# Use sqlite3 in production if DATABASE_URL is provided
+if os.environ.get('DATABASE_URL'):
     DATABASES['default'] = dj_database_url.config(
         default=env('DATABASE_URL'),
         conn_max_age=600,
@@ -104,7 +108,7 @@ USE_I18N = True
 USE_TZ = True
 
 # ============================================
-# Static Files (WhiteNoise)
+# Static Files
 # ============================================
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
@@ -114,7 +118,6 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
-# Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # ============================================
@@ -127,7 +130,7 @@ CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=[
 CORS_ALLOW_CREDENTIALS = True
 
 # ============================================
-# Django REST Framework Configuration
+# Django REST Framework
 # ============================================
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
@@ -141,96 +144,71 @@ REST_FRAMEWORK = {
     'DATETIME_FORMAT': '%Y-%m-%d %H:%M:%S',
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle'
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '100/hour',
-        'user': '1000/hour'
+        'anon': '100/hour',  # Generous for demo
     }
 }
 
 # ============================================
-# Persistent Storage Configuration
+# Temporary Storage (Ephemeral)
 # ============================================
-IS_RAILWAY = os.environ.get('RAILWAY_ENVIRONMENT') is not None
-
-if IS_RAILWAY:
-    # Use persistent volume on Railway
-    DATA_ROOT = Path('/app/data')
-else:
-    # Use local directory for development
-    DATA_ROOT = BASE_DIR / 'data'
+# On Render, use system temp directory (ephemeral, auto-cleaned)
+TEMP_ROOT = Path(tempfile.gettempdir()) / 'wrf_temp'
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 # ============================================
 # WRF Data Configuration
 # ============================================
 WRF_CONFIG = {
-    # Proxy Server (First Hop) - SSH Key Authentication
+    # Proxy Server (Jump Host)
     'JUMP_HOST': env('WRF_JUMP_HOST', default=''),
     'JUMP_PORT': env.int('WRF_JUMP_PORT', default=22),
     'JUMP_USERNAME': env('WRF_JUMP_USERNAME', default=''),
-    'JUMP_PASSWORD': env('WRF_JUMP_PASSWORD', default=''),  # Optional
-    'JUMP_SSH_KEY': env('WRF_JUMP_SSH_KEY_BASE64', default=''),  # Base64 encoded
+    'JUMP_PASSWORD': env('WRF_JUMP_PASSWORD', default=''),
+    'JUMP_SSH_KEY': env('WRF_JUMP_SSH_KEY_BASE64', default=''),
 
-    # Target SSH Server (Second Hop) - SSH Key Authentication
+    # Target SSH Server
     'SSH_HOST': env('WRF_TARGET_HOST', default=''),
     'SSH_PORT': env.int('WRF_TARGET_PORT', default=22),
     'SSH_USERNAME': env('WRF_TARGET_USERNAME', default=''),
-    'SSH_PASSWORD': env('WRF_TARGET_PASSWORD', default=''),  # Optional
-    'SSH_PRIVATE_KEY': env('WRF_SSH_PRIVATE_KEY_BASE64', default=''),  # Base64 encoded
+    'SSH_PASSWORD': env('WRF_TARGET_PASSWORD', default=''),
+    'SSH_PRIVATE_KEY': env('WRF_SSH_PRIVATE_KEY_BASE64', default=''),
 
-    # Remote Paths
+    # Remote Path
     'REMOTE_BASE_PATH': env('WRF_REMOTE_GRIB_PATH', default='/home/nwp/DA/SEVERE'),
 
-    # Local Paths (Use persistent volume)
-    'LOCAL_DATA_PATH': DATA_ROOT / env('LOCAL_DATA_PATH', default='raw'),
-    'PROCESSED_DATA_PATH': DATA_ROOT / env('PROCESSED_DATA_PATH', default='processed'),
+    # Local paths - use temp directory (auto-cleaned)
+    'LOCAL_DATA_PATH': TEMP_ROOT,
+    'PROCESSED_DATA_PATH': TEMP_ROOT / 'processed',
 
     # Model Configuration
     'BASE_TIME': env('WRF_BASE_TIME', default='19:00'),
     'TIMEZONE': env('WRF_TIMEZONE', default='Africa/Nairobi'),
     'FORECAST_HOURS': env.int('WRF_FORECAST_HOURS', default=72),
     'TIME_STEP_HOURS': env.int('WRF_TIME_STEP_HOURS', default=3),
-
-    # Data Retention
-    'KEEP_RAW_FILES_DAYS': env.int('KEEP_RAW_FILES_DAYS', default=7),
-    'KEEP_PROCESSED_FILES_DAYS': env.int('KEEP_PROCESSED_FILES_DAYS', default=30),
 }
 
-# Ensure local directories exist
-for path in [WRF_CONFIG['LOCAL_DATA_PATH'], WRF_CONFIG['PROCESSED_DATA_PATH']]:
-    path.mkdir(parents=True, exist_ok=True)
-
-# Cache directory
-CACHE_DIR = DATA_ROOT / 'cache'
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-# Logging directory
-LOG_DIR = DATA_ROOT / 'logs'
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
 # ============================================
-# Cache Configuration
+# Cache Configuration (In-Memory)
 # ============================================
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'wrf-grib-cache',
+        'LOCATION': 'wrf-data-cache',
+        'TIMEOUT': 900,  # 15 minutes
         'OPTIONS': {
-            'MAX_ENTRIES': 200
+            'MAX_ENTRIES': 100  # Store up to 100 timesteps in memory
         }
     }
 }
 
 # ============================================
-# Celery Configuration
+# Celery Configuration (DISABLED)
 # ============================================
-CELERY_BROKER_URL = env('CELERY_BROKER_URL', default=env('REDIS_URL', default='redis://localhost:6379/0'))
-CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default=env('REDIS_URL', default='redis://localhost:6379/0'))
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'Africa/Nairobi'
+# Celery is not needed for on-demand processing
+CELERY_BROKER_URL = env('CELERY_BROKER_URL', default='')
+CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default='')
 
 # ============================================
 # Logging Configuration
@@ -240,7 +218,7 @@ LOGGING = {
     'disable_existing_loggers': False,
     'formatters': {
         'verbose': {
-            'format': '{levelname} {asctime} {module} {process:d} {message}',
+            'format': '{levelname} {asctime} {module} {message}',
             'style': '{',
         },
         'simple': {
@@ -253,26 +231,19 @@ LOGGING = {
             'class': 'logging.StreamHandler',
             'formatter': 'verbose',
         },
-        'file': {
-            'class': 'logging.handlers.RotatingFileHandler',
-            'filename': LOG_DIR / 'kmd_backend.log',
-            'maxBytes': 10485760,  # 10MB
-            'backupCount': 5,
-            'formatter': 'verbose',
-        },
     },
     'root': {
-        'handlers': ['console', 'file'],
+        'handlers': ['console'],
         'level': env('LOG_LEVEL', default='INFO'),
     },
     'loggers': {
         'wrf_data': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console'],
             'level': 'INFO',
             'propagate': False,
         },
         'django': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console'],
             'level': 'INFO',
             'propagate': False,
         },
@@ -292,8 +263,3 @@ if not DEBUG:
     SECURE_HSTS_SECONDS = 31536000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
-
-# ============================================
-# Cron Security Token
-# ============================================
-CRON_SECRET_TOKEN = env('CRON_SECRET_TOKEN', default='change-this-in-production')
