@@ -23,7 +23,9 @@ if os.path.exists(env_file):
 # Security Settings
 SECRET_KEY = env('SECRET_KEY', default='django-insecure-change-this-in-production')
 DEBUG = env('DEBUG')
-ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['localhost', '127.0.0.1'])
+ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['localhost', '127.0.0.1', 'kmd-nwp-backend.onrender.com'])
+
+
 
 # Application definition
 INSTALLED_APPS = [
