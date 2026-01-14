@@ -26,7 +26,6 @@ DEBUG = env('DEBUG')
 ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=['localhost', '127.0.0.1', 'kmd-nwp-backend.onrender.com'])
 
 
-
 # Application definition
 INSTALLED_APPS = [
     'django.contrib.admin',
