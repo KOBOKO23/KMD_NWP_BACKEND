@@ -1,3 +1,4 @@
+
 """
 Celery configuration for KMD Weather Backend
 File: config/celery.py

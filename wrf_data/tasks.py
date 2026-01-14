@@ -9,6 +9,7 @@ from django.utils import timezone
 from django.conf import settings
 from datetime import datetime, timedelta
 import logging
+from celery import shared_task
 import os
 
 logger = logging.getLogger(__name__)
