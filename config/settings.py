@@ -85,7 +85,7 @@ DATABASES = {
     }
 }
 
-# Use sqlite3 in production if DATABASE_URL is provided
+# Use PostgreSQL in production if DATABASE_URL is provided
 if os.environ.get('DATABASE_URL'):
     DATABASES['default'] = dj_database_url.config(
         default=env('DATABASE_URL'),
@@ -204,9 +204,8 @@ CACHES = {
 }
 
 # ============================================
-# Celery Configuration (DISABLED)
+# Celery Configuration (DISABLED for on-demand mode)
 # ============================================
-# Celery is not needed for on-demand processing
 CELERY_BROKER_URL = env('CELERY_BROKER_URL', default='')
 CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default='')
 
@@ -263,3 +262,8 @@ if not DEBUG:
     SECURE_HSTS_SECONDS = 31536000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
+
+# ============================================
+# Cron Security Token (for manual fetch endpoint)
+# ============================================
+CRON_SECRET_TOKEN = env('CRON_SECRET_TOKEN', default='change-this-in-production')
