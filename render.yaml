@@ -1,0 +1,75 @@
+services:
+  - type: web
+    name: kmd-weather-backend
+    env: python
+    plan: free
+    region: oregon
+    
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      python manage.py collectstatic --noinput
+      python manage.py migrate
+    
+    startCommand: gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --preload
+    
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      
+      - key: DEBUG
+        value: "False"
+      
+      - key: SECRET_KEY
+        generateValue: true
+      
+      - key: ALLOWED_HOSTS
+        value: ".onrender.com,localhost"
+      
+      - key: CORS_ALLOWED_ORIGINS
+        value: "http://localhost:3000"
+      
+      - key: WRF_JUMP_HOST
+        value: "196.202.217.197"
+      
+      - key: WRF_JUMP_PORT
+        value: "10002"
+      
+      - key: WRF_JUMP_USERNAME
+        value: "nwp1"
+      
+      - key: WRF_JUMP_SSH_KEY_BASE64
+        sync: false
+      
+      - key: WRF_TARGET_HOST
+        value: "192.168.1.201"
+      
+      - key: WRF_TARGET_PORT
+        value: "22"
+      
+      - key: WRF_TARGET_USERNAME
+        value: "nwp"
+      
+      - key: WRF_SSH_PRIVATE_KEY_BASE64
+        sync: false
+      
+      - key: WRF_REMOTE_GRIB_PATH
+        value: "/home/nwp/DA/SEVERE"
+      
+      - key: WRF_BASE_TIME
+        value: "19:00"
+      
+      - key: WRF_TIMEZONE
+        value: "Africa/Nairobi"
+      
+      - key: WRF_FORECAST_HOURS
+        value: "72"
+      
+      - key: CRON_SECRET_TOKEN
+        sync: false
+      
+      - key: LOG_LEVEL
+        value: "INFO"
+    
+    healthCheckPath: /api/ping/
+    autoDeploy: true
